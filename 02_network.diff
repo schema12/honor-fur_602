@@ -1,0 +1,9 @@
+--- a/target/linux/mediatek/filogic/base-files/etc/board.d/02_network
++++ b/target/linux/mediatek/filogic/base-files/etc/board.d/02_network
+@@ -53,5 +53,6 @@ mediatek_setup_interfaces()
+ 	cmcc,a10*|\
+ 	fzs,5gcpe-p3|\
+ 	jcg,q30-pro|\
++	honor,fur-602|\
+ 	qihoo,360t7|\
+ 	tenbay,wr3000k)

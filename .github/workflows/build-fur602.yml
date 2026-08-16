@@ -1,0 +1,106 @@
+name: Build Honor FUR-602 OpenWrt firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'LEDE/OpenWrt source URL'
+        required: true
+        default: 'https://github.com/coolsnowwolf/lede'
+      repo_branch:
+        description: 'Source branch'
+        required: true
+        default: 'master'
+  push:
+    branches: [ main ]
+    paths:
+      - '.config'
+      - 'diy-part2.sh'
+      - 'mt7981b-honor-fur-602.dts'
+      - '.github/workflows/build-fur602.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REPO_URL: ${{ github.event.inputs.repo_url || 'https://github.com/coolsnowwolf/lede' }}
+  REPO_BRANCH: ${{ github.event.inputs.repo_branch || 'master' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout build config
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses5-dev libssl-dev python3 python3-pip python3-setuptools \
+            rsync unzip zlib1g-dev file wget curl subversion patch swig libelf-dev
+
+      - name: Clone LEDE/OpenWrt source
+        run: |
+          git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" openwrt
+
+      - name: Inject Honor FUR-602 device support
+        run: |
+          cp -f .config openwrt/.config
+          cp -f diy-part2.sh openwrt/diy-part2.sh
+          cd openwrt
+          chmod +x diy-part2.sh
+          ./diy-part2.sh
+
+      - name: Update and install feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Generate .config
+        working-directory: openwrt
+        run: make defconfig
+
+      - name: Show final target
+        working-directory: openwrt
+        run: |
+          grep -E 'CONFIG_TARGET_mediatek|DEVICE_honor_fur602' .config || true
+
+      - name: Download packages
+        working-directory: openwrt
+        run: make download -j8
+
+      - name: Build firmware
+        working-directory: openwrt
+        run: |
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          find openwrt/bin/targets/mediatek/filogic -maxdepth 1 -type f \
+            \( -name '*.bin' -o -name '*.itb' -o -name '*.tar' -o -name '*.ubi' \) \
+            -exec cp {} out/ \; 2>/dev/null || true
+          ls -la out/
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: honor-fur602-firmware
+          path: out/
+          retention-days: 14
