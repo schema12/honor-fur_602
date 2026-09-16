@@ -1,0 +1,145 @@
+# ---------------------------------------------------------------------------
+# HONOR FUR-602 / FUR-603 -- build configuration for ImmortalWrt 24.10
+# target/linux/mediatek/filogic,  kernel 6.6
+#
+# Applied by diy-part2.sh as follows:
+#   * the kernel-config part  -> appended to target/linux/mediatek/filogic/config-6.6
+#   * the build-config part   -> merged into the build .config (CONFIG_ALL_KMODS)
+# ---------------------------------------------------------------------------
+
+
+# ===========================================================================
+# PART 1 -- kernel config fragment (goes into filogic/config-6.6)
+# ===========================================================================
+#
+# WHY THIS PART IS EMPTY (and why that is the *correct*, upstream-native answer)
+# ---------------------------------------------------------------------------
+# ImmortalWrt/OpenWrt deliberately keep tc/qdisc/ifb, the whole netfilter stack,
+# mac80211/mt76 and USB *out of* the target kernel config, and ship them as
+# opt-in kmod packages instead.  Verified in this very tree
+# (immortalwrt @ openwrt-24.10, aa5e28abcccf):
+#
+#   target/linux/generic/config-6.6
+#     # CONFIG_NET_SCH_HTB is not set        # CONFIG_IFB is not set
+#     # CONFIG_NET_SCH_CAKE is not set       # CONFIG_NET_ACT_MIRRED is not set
+#     # CONFIG_NET_CLS_U32 is not set        # CONFIG_NF_TABLES is not set
+#     # CONFIG_MAC80211 is not set           # CONFIG_CFG80211 is not set
+#     # CONFIG_PPPOE is not set              # CONFIG_CRYPTO_HW is not set
+#     # CONFIG_USB_XHCI_HCD is not set
+#   (only NET_SCHED, NET_SCH_FQ_CODEL, NET_SCH_FIFO, NET_CLS, NET_INGRESS,
+#    NET_EGRESS, NET_XGRESS are =y)
+#
+#   target/linux/mediatek/filogic/config-6.6 -- contains NO NET_SCH_*/NET_CLS_*/
+#   NET_ACT_*/IFB/MAC80211/CFG80211 symbol at all.
+#
+# The authoritative reference port for this exact board -- hanwckf/
+# immortalwrt-mt798x @ openwrt-21.02, target/linux/mediatek/mt7981/config-5.4 --
+# likewise contains ZERO of those symbols.  So this is intentional upstream
+# design, not something missing that we have to repair.
+#
+# When a kmod package IS selected, include/kernel-defaults.mk feeds its KCONFIG
+# symbols back into the kernel config:
+#
+#   package-metadata.pl kconfig ... > $(LINUX_DIR)/.config.override
+#   kconfig.pl 'm+' '+' .config.target /dev/null .config.override > .config.set
+#
+# gen_kconfig_overrides() (scripts/package-metadata.pl:53) turns every KCONFIG
+# symbol of a selected kmod-* package into `=m`; because generic/config-6.6
+# stores them as `# ... is not set` (parsed as '#undef'), the override wins.
+# include/kernel.mk:245 then sees `m` and really does build + package the .ko.
+#
+# => Baking these in as `=y` here would bloat the kernel, change the ABI and
+#    diverge from upstream for zero benefit.  DO NOT ADD THEM.
+#
+#   ... and <https://github.com/immortalwrt/immortalwrt/blob/openwrt-24.10/target/linux/mediatek/filogic/config-6.6>
+
+# --- Intentionally empty: nothing to add. ----------------------------------
+
+
+# ===========================================================================
+# PART 2 -- build config: make the kmod set really exist (goes into .config)
+# ===========================================================================
+#
+# THE ACTUAL PROBLEM, stated precisely
+# ---------------------------------------------------------------------------
+# All QoS/SQM capability the project needs is provided by these kmod packages:
+#
+#   kmod-sched-core   sch_hfsc sch_htb sch_tbf sch_ingress cls_basic cls_fw
+#                     cls_route cls_flow cls_u32 em_u32 act_gact act_mirred
+#                     act_skbedit cls_matchall     (netsupport.mk:713)
+#   kmod-sched        sch_codel sch_gred sch_multiq sch_sfq sch_teql sch_fq
+#                     sch_ets act_pedit act_simple act_skbmod act_csum
+#                     em_cmp em_nbyte em_meta em_text
+#   kmod-sched-cake   CONFIG_NET_SCH_CAKE          (CAKE  -- core of SQM)
+#   kmod-sched-prio   CONFIG_NET_SCH_PRIO
+#   kmod-sched-fq-pie CONFIG_NET_SCH_FQ_PIE
+#   kmod-sched-ctinfo CONFIG_NET_ACT_CTINFO
+#   kmod-sched-act-vlan / sched-act-sample / sched-act-ipt / sched-bpf / ...
+#   kmod-ifb          CONFIG_IFB       (netdevices.mk:1411 -- IFB for ingress)
+#
+# BUT: `ALL_KMODS` in config/Config-build.in has **no `default y`**:
+#
+#   config ALL_KMODS
+#       bool "Select all kernel module packages by default"
+#
+# while package-metadata.pl:310-317 gives every kmod the default
+#
+#       default m if ALL || ALL_NONSHARED || ALL_KMODS
+#
+# and NOTHING in the base tree depends on kmod-sched*/kmod-ifb
+# (only kmod-sched-act-sample is pulled in by a tunnel option, and
+#  sqm-scripts / luci-app-sqm live in the `packages` feed, not here).
+#
+# => In a default build these packages are neither built nor published, so a
+#    future `opkg install kmod-sched-cake` would fail with "not found".
+#    THIS is precisely the failure mode the project must avoid.
+#
+# THE FIX
+# ---------------------------------------------------------------------------
+# Build with CONFIG_ALL_KMODS=y.  That flips the `default m if ... ALL_KMODS`
+# line for *every* kmod package, so the complete, ABI-matched kmod set is
+# compiled and published into bin/.../packages/ -- while the image itself still
+# only installs DEFAULT_PACKAGES + DEVICE_PACKAGES.  Result:
+#
+#   * firmware stays lean (no LuCI/SQM/AdGuard/Docker baked in), yet
+#   * `opkg install kmod-sched-cake kmod-ifb ...` works on the device later,
+#     with a kernel ABI that matches the running kernel exactly.
+#
+# WHY `m` DOES NOT BLOAT THE IMAGE (verified in-tree, not assumed):
+#   * kmod packages carry `Type: ipkg` (include/package-dumpinfo.mk:44 and the
+#     default in include/package.mk:328-329), so scripts/metadata.pm:291 sets
+#     $pkg->{tristate} = 1 and package-metadata.pl:308 emits a Kconfig
+#     `tristate` symbol -- NOT a bool.  So `m` is a legal value.
+#   * `m` = "build the .ipk and publish it in the feed", `y` = "build it AND
+#     install it into the rootfs".  Only DEFAULT_PACKAGES / DEVICE_PACKAGES are
+#     forced to `y`, so only those end up in the firmware.
+#
+# This is the standard, supported OpenWrt way to satisfy "kernel capabilities
+# complete, user space minimal" -- it does NOT mean "turn everything on in the
+# kernel".  It is deliberately NOT `CONFIG_ALL=y` (that would also enable every
+# userspace package and blow up the image).
+#
+# Cross-check against the reference implementation: hanwckf/immortalwrt-mt798x
+# @ openwrt-21.02, defconfig/mt7981-ax3000.config (the same file that selects
+# DEVICE_honor_fur-602) sets only
+#
+#     CONFIG_PACKAGE_kmod-sched-core=y
+#     CONFIG_PACKAGE_kmod-ifb=y
+#
+# and does NOT set kmod-sched, kmod-sched-cake, kmod-sched-prio, kmod-sched-fq-pie
+# or kmod-sched-ctinfo at all.  So even the reference build cannot serve an
+# `opkg install sqm-scripts` afterwards (CAKE would be missing) -- exactly the
+# failure mode this project must avoid.  CONFIG_ALL_KMODS=y closes that gap
+# without adding a single byte to the firmware image.
+#
+# Enforced in .config by diy-part2.sh:
+#   CONFIG_ALL_KMODS=y
+#
+# and verified in CI by .github/workflows/build-fur602.yml ("verify" step),
+# which asserts that kmod-sched-core / kmod-sched / kmod-sched-cake / kmod-ifb
+# / kmod-mac80211 / kmod-mt7915e actually appear in the published Packages index
+# and that the .ipks carry the same copyright/kernel ABI as the built kernel.
+#
+# If a future requirement genuinely needs something compiled INTO the kernel
+# rather than installable afterwards, add it to PART 1 *with* a comment naming
+# the reason.  Never blanket-enable symbols.

@@ -1,20 +1,53 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR MIT
 //
-// HONOR FUR-602 (a.k.a. 荣耀 XU50 / XT50 / XC50, 联通定制版)
-//
+// HONOR FUR-602 / FUR-603  (a.k.a. 荣耀 XU50 / XT50 / XC50, 联通定制版)
 //   SoC   : MediaTek MT7981B (Filogic 820)
 //   RAM   : 256 MiB DDR3
-//   Flash : 128 MiB SPI-NAND (NMBM)
-//   WLAN  : MT7981 2.4G (2x2) + MT7976CN 5G (2x2) = AX3000
-//   ETH   : MT7531 switch, 3x 1G LAN + 1x 1G WAN (all on gmac0)
+//   Flash : 128 MiB SPI-NAND, NMBM enabled
+//   WLAN  : MT7981 2.4G 2x2 + MT7976CN 5G 2x2  = AX3000
+//   ETH   : MT7531 switch, 1x 1G WAN + 3x 1G LAN, all behind gmac0
 //
-// This device tree targets the DSA layout used by LEDE (coolsnowwolf/lede)
-// and upstream OpenWrt 23.05+ and assumes the hanwckf bl-mt798x U-Boot with
-// the "expand(114m)" mtd layout has been flashed.
+// Hardware facts in this file are taken from, and cross-checked against:
+//   1. hanwckf/bl-mt798x @ 20241115  (tag, commit 15ad0ed949043bcb)
+//        uboot-mtk-20230718-09eda825/arch/arm/dts/mt7981-honor_fur-602.dts
+//          -> gpio 0/1 (keys), gpio 8/13 (LEDs), gpio 39 (switch reset),
+//             gmac0 = 2500base-x / 2500 Mbps, "mediatek,switch = mt7531"
+//        uboot-mtk-20230718-09eda825/configs/mt7981_honor_fur-602{,_multi_layout}_defconfig
+//          -> 128 MiB SPI-NAND, NMBM
+//        uboot-mtk-20230718-09eda825/board/mediatek/common/mtd_layout.c
+//          -> mtd-layout expand(114m): bl2|u-boot-env|factory|Trace|fip|ubi(116736k)
+//   2. hanwckf/immortalwrt-mt798x @ openwrt-21.02
+//        target/linux/mediatek/files-5.4/arch/arm64/boot/dts/mediatek/mt7981-honor-fur-602.dts
+//          -> authoritative port wiring, NMBM overlay, SPI calibration data,
+//             same make/model string "HONOR FUR-602/603"
+//        target/linux/mediatek/image/mt7981.mk (Device/honor_fur-602)
+//          -> IMAGE_SIZE 116736k, KERNEL_IN_UBI, factory.bin + sysupgrade-tar
+//
+// This device tree follows the native ImmortalWrt 24.10 mediatek/filogic DSA
+// layout (cf. mt7981b-h3c-magic-nx30-pro-nmbm.dts, mt7981b-qihoo-360t7.dts).
+//
+// Flash/upgrade model (matches what the bl-mt798x U-Boot actually does):
+//   * The U-Boot boot path is mtd_boot_image() ->
+//       get_mtd_device_nm("kernel") : if a *MTD partition* named "kernel"
+//       exists it boots a bare FIT from it; otherwise it falls through to
+//       get_mtd_device_nm("ubi") -> boot_from_ubi(), which reads the FIT out
+//       of the UBI volume named "kernel".
+//   * Our ubinize layout (KERNEL_IN_UBI=1) creates exactly the volumes
+//     "kernel", "rootfs", "rootfs_data" -- so boot_from_ubi() is the path
+//     that is exercised, and U-Boot additionally uses these same volume
+//     names when flashing a sysupgrade tar (write_ubi2_tar_image).
+//   * Therefore NO fitblk / rootdisk / volname="fit" is used here: that is a
+//     different (newer) OpenWrt layout which would require a "fit" volume that
+//     this U-Boot does not look for.
+//
+// Requires the hanwckf/bl-mt798x "mt7981_honor_fur-602" U-Boot (20241115 or
+// the 20230718 build it is derived from) with the expand(114m) mtd layout.
+// The stock HonOR U-Boot is signature-locked and cannot boot this firmware.
 
 /dts-v1/;
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
 
 #include "mt7981.dtsi"
 
@@ -24,11 +57,11 @@
 
 	aliases {
 		serial0 = &uart0;
-
-		led-boot = &status_red_led;
-		led-failsafe = &status_red_led;
-		led-running = &status_green_led;
-		led-upgrade = &status_green_led;
+		label-mac-device = &gmac0;
+		led-boot = &led_status_red;
+		led-failsafe = &led_status_red;
+		led-running = &led_status_green;
+		led-upgrade = &led_status_green;
 	};
 
 	chosen {
@@ -42,15 +75,16 @@
 	gpio-keys {
 		compatible = "gpio-keys";
 
-		reset {
+		button-reset {
 			label = "reset";
 			linux,code = <KEY_RESTART>;
 			gpios = <&pio 1 GPIO_ACTIVE_LOW>;
 		};
 
-		mesh {
+		button-mesh {
 			label = "mesh";
 			linux,code = <BTN_9>;
+			linux,input-type = <EV_SW>;
 			gpios = <&pio 0 GPIO_ACTIVE_LOW>;
 		};
 	};
@@ -58,13 +92,15 @@
 	leds {
 		compatible = "gpio-leds";
 
-		status_green_led: led_status_green {
-			label = "green:status";
+		led_status_green: green {
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_GREEN>;
 			gpios = <&pio 8 GPIO_ACTIVE_LOW>;
 		};
 
-		status_red_led: led_status_red {
-			label = "red:status";
+		led_status_red: red {
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_RED>;
 			gpios = <&pio 13 GPIO_ACTIVE_LOW>;
 		};
 	};
@@ -90,7 +126,7 @@
 };
 
 &mdio_bus {
-	switch: switch@0 {
+	switch: switch@1f {
 		compatible = "mediatek,mt7531";
 		reg = <31>;
 		reset-gpios = <&pio 39 GPIO_ACTIVE_HIGH>;
@@ -106,7 +142,7 @@
 	pinctrl-0 = <&spi0_flash_pins>;
 	status = "okay";
 
-	spi_nand@0 {
+	spi_nand: spi_nand@0 {
 		compatible = "spi-nand";
 		#address-cells = <1>;
 		#size-cells = <1>;
@@ -116,9 +152,29 @@
 		spi-tx-bus-width = <4>;
 		spi-rx-bus-width = <4>;
 
+		/*
+		 * NMBM: matches CONFIG_ENABLE_NAND_NMBM=y in the bl-mt798x
+		 * mt7981_honor_fur-602 U-Boot, which maps the whole chip through
+		 * its own bad-block table. The BMT area is carved out of the
+		 * top of the device, so the partitions below are the *free*
+		 * area and must stay in sync with the U-Boot mtd-layout
+		 * "expand(114m)" mtdparts string.
+		 */
 		mediatek,nmbm;
 		mediatek,bmt-max-ratio = <1>;
 		mediatek,bmt-max-reserved-blocks = <64>;
+
+		/*
+		 * SPI calibration data, taken verbatim from the hanwckf
+		 * reference DTS for this board. Without it the SPI-NAND
+		 * controller may sample at the wrong delay on this PCB.
+		 */
+		spi-cal-enable;
+		spi-cal-mode = "read-data";
+		spi-cal-datalen = <7>;
+		spi-cal-data = /bits/ 8 <0x53 0x50 0x49 0x4E 0x41 0x4E 0x44>; /* 'SPINAND' */
+		spi-cal-addrlen = <5>;
+		spi-cal-addr = /bits/ 32 <0x0 0x0 0x0 0x0 0x0>;
 
 		partitions {
 			compatible = "fixed-partitions";
@@ -250,5 +306,12 @@
 &wifi {
 	status = "okay";
 
+	/*
+	 * WiFi EEPROM / calibration data lives at offset 0 of the "factory"
+	 * partition. This is the de-facto MT7981 convention and matches the
+	 * hanwckf reference board support (LEDE 5.4 used the same layout).
+	 * TODO(verify-on-hardware): confirm the 2.4G/5G eeprom blobs are
+	 * actually present at 0x0 by dumping "factory" on a real unit.
+	 */
 	mediatek,mtd-eeprom = <&factory 0x0>;
 };
