@@ -1,4 +1,4 @@
-# HONOR FUR-602/603 → ImmortalWrt 24.10 设备移植
+# HONOR FUR-602/603 → ImmortalWrt 24.10 设备移植(AI!!!)
 
 把 **荣耀 FUR-602 / FUR-603**（联通定制版 XU50，与 XT50/XC50 同板型，MT7981B）
 移植到 **ImmortalWrt 24.10**（`openwrt-24.10` 分支，kernel **6.6**）的完整方案。
