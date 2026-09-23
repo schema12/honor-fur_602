@@ -16,7 +16,7 @@
 
 1. **必须已刷入 [hanwckf/bl-mt798x](https://github.com/hanwckf/bl-mt798x) 的定制 U-Boot**
    （`mt7981_honor_fur-602`）。原厂 U-Boot 校验并锁定镜像签名，**无法直接刷写**本固件。
-   刷 U-Boot 需拆机 + TTL 串口，不属于本仓库范围。
+   
 
 2. **必须切换分区布局为 `expand(114m)`**。
    U-Boot 内置两套布局，**默认是 `default`（ubi 仅 64 MiB）**；
@@ -124,7 +124,7 @@ tar 内部结构与 kmod `.ipk` 是否发布，并输出 Build summary。任何�
 1. 确认 U-Boot env `mtd_layout_label` = **`expand(114m)`**（见开头"硬性前提"）。
 2. 按住 **Reset** 上电，进入 U-Boot Web 恢复页（默认 `192.168.1.1`，自动 DHCP）。
 3. 上传 `...-honor_fur-602-factory.bin`，等待重启。
-4. 首次登录 `192.168.1.1`（无密码）。LAN 用 `factory@0x2a`，WAN 用 `factory@0x24`。
+4. 首次登录 `192.168.1.1`（password）。LAN 用 `factory@0x2a`，WAN 用 `factory@0x24`。
 5. 后续升级用 `...-honor_fur-602-sysupgrade.bin`（LuCI 或 `sysupgrade`，保留配置）。
 
 ---
