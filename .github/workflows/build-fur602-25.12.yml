@@ -31,9 +31,11 @@ name: Build HONOR FUR-602/603 (ImmortalWrt 25.12.2)
 #   the *convention* via in-tree sibling DTS rather than the file itself.
 # * CONFIG_ALL_KMODS=y builds + publishes the complete, ABI-matched kmod set
 #   (tc/qdisc/CAKE/IFB, netfilter, mac80211/mt76, USB, ...) so those can be
-#   `opkg install`ed later, while the image itself still only contains
+#   installed later, while the image itself still only contains
 #   DEFAULT_PACKAGES + DEVICE_PACKAGES. The workflow *proves* this by checking
-#   the published .ipk files, not just the .config.
+#   the published package files, not just the .config.
+#   25.12 defaults to CONFIG_USE_APK=y, so those packages are .apk with a
+#   packages.adb index; the checks detect the format instead of assuming .ipk.
 # * Artifacts are named with the source SHA and the run id, and every file is
 #   SHA256-listed, so nothing from an older build can be mistaken for fresh.
 # * No root password is hardcoded and no package-signature check is disabled.
@@ -351,8 +353,8 @@ jobs:
 
           # CONFIG_ALL_KMODS=y publishes the complete, ABI-matched kmod set
           # (tc/qdisc/CAKE/IFB, netfilter, mac80211/mt76, USB, ...) so they can
-          # be `opkg install`ed later, without adding them to the image. Allow a
-          # deliberate opt-out for a quick boot-only test build.
+          # be installed on the device later, without adding them to the image.
+          # Allow a deliberate opt-out for a quick boot-only test build.
           if [ "${{ github.event.inputs.build_all_kmods || 'true' }}" = "false" ]; then
             echo "NOTE: build_all_kmods=false -- dropping CONFIG_ALL_KMODS=y"
             sed -i '/^CONFIG_ALL_KMODS=y$/d' openwrt/.config
@@ -405,7 +407,7 @@ jobs:
             if ! grep -q '^CONFIG_ALL_KMODS=y' .config; then
               echo "::error::CONFIG_ALL_KMODS=y missing: the full kmod set (tc/qdisc/CAKE/IFB,"
               echo "::error::netfilter, mac80211/mt76, USB, ...) would not be published, and a"
-              echo "::error::later 'opkg install kmod-sched-cake' would fail."
+              echo "::error::later installing kmod-sched-cake on the device would fail."
               exit 1
             fi
             echo "  CONFIG_ALL_KMODS=y present"
@@ -497,35 +499,76 @@ jobs:
 
           # ---------------------------------------------------------------- #
           # Full kmod set: prove it by the published packages, not by a log.
+          #
+          # 25.12 defaults to CONFIG_USE_APK=y, so packages are .apk with a
+          # packages.adb index. 24.10 used .ipk with a Packages index. We
+          # detect which format this build produced rather than assuming --
+          # assuming .ipk here is exactly what broke the first run.
           # ---------------------------------------------------------------- #
-          echo "===== published kmod packages ====="
+          echo "===== published package format ====="
           PKGDIR="$BIN/packages"
-          if [ "${{ github.event.inputs.build_all_kmods || 'true' }}" = "false" ]; then
-            echo "  (skipped: build_all_kmods=false)"
-          else
-            test -d "$PKGDIR" || { echo "::error::$PKGDIR not found -- full kmod set was NOT published"; exit 1; }
+          test -d "$PKGDIR" || { echo "::error::$PKGDIR not found -- no packages were published"; exit 1; }
 
+          N_APK=$(ls "$PKGDIR"/*.apk 2>/dev/null | wc -l)
+          N_IPK=$(ls "$PKGDIR"/*.ipk 2>/dev/null | wc -l)
+          echo "  .apk files = $N_APK"
+          echo "  .ipk files = $N_IPK"
+
+          if [ "$N_APK" -gt 0 ]; then
+            PKGEXT="apk"
+            KMOD_COUNT=$(ls "$PKGDIR"/kmod-*.apk 2>/dev/null | wc -l)
+          elif [ "$N_IPK" -gt 0 ]; then
+            PKGEXT="ipk"
             KMOD_COUNT=$(ls "$PKGDIR"/kmod-*.ipk 2>/dev/null | wc -l)
-            echo "published kmod .ipk count = $KMOD_COUNT"
+          else
+            echo "::error::$PKGDIR contains neither .apk nor .ipk files"
+            ls -la "$PKGDIR" | head -20
+            exit 1
+          fi
+          echo "  detected package format: .$PKGEXT"
+          echo "  published kmod .$PKGEXT count = $KMOD_COUNT"
+
+          if [ "${{ github.event.inputs.build_all_kmods || 'true' }}" = "false" ]; then
+            echo "  (build_all_kmods=false: full kmod set not expected)"
+          else
             # A full kmod build publishes many hundreds; a handful means the
             # knob did not take effect.
             if [ "$KMOD_COUNT" -lt 100 ]; then
-              echo "::error::only $KMOD_COUNT kmod .ipk files published -- CONFIG_ALL_KMODS did not take effect"
+              echo "::error::only $KMOD_COUNT kmod .$PKGEXT files published -- CONFIG_ALL_KMODS did not take effect"
               exit 1
             fi
+          fi
 
-            for p in kmod-sched-core kmod-sched kmod-sched-cake kmod-ifb \
-                     kmod-mac80211 kmod-cfg80211 kmod-mt7915e kmod-nft-core kmod-pppoe; do
-              if ls "$PKGDIR"/${p}_*.ipk >/dev/null 2>&1; then
-                echo "  OK   $p"
-              else
-                echo "  MISS $p"
-              fi
-            done
+          echo "===== key kmod packages (QoS/SQM, wifi, netfilter) ====="
+          MISSING=0
+          for p in kmod-sched-core kmod-sched kmod-sched-cake kmod-ifb \
+                   kmod-mac80211 kmod-cfg80211 kmod-mt7915e kmod-nft-core kmod-pppoe; do
+            # kmod packages are named <name>_<ver>.<ext> (ipk) or
+            # <name>-<ver>.apk. Check each pattern separately with find --
+            # `ls pat1 pat2` returns non-zero when EITHER operand is missing,
+            # which would report a false MISS for a package that is present.
+            if find "$PKGDIR" -maxdepth 1 -type f \
+                 \( -name "${p}_*.$PKGEXT" -o -name "${p}-*.$PKGEXT" \) | grep -q .; then
+              echo "  OK   $p"
+            else
+              echo "  MISS $p"
+              MISSING=$((MISSING + 1))
+            fi
+          done
+          # The wifi + QoS set is the whole point of this build, so treat a
+          # missing one as a hard failure rather than a note.
+          [ "$MISSING" -eq 0 ] \
+            || { echo "::error::$MISSING required kmod package(s) missing"; exit 1; }
 
-            # The index must exist so opkg can resolve these on the device.
-            ls "$PKGDIR"/Packages* >/dev/null 2>&1 \
-              || { echo "::error::$PKGDIR has no Packages index"; exit 1; }
+          # The index must exist so the package manager on the device can
+          # resolve these. apk uses packages.adb; opkg uses Packages.
+          if [ "$PKGEXT" = "apk" ]; then
+            ls "$PKGDIR"/packages.adb >/dev/null 2>&1 \
+              || { echo "::error::$PKGDIR has no packages.adb index (apk)"; exit 1; }
+            echo "  OK   packages.adb index present"
+          else
+            ls "$PKGDIR"/Packages >/dev/null 2>&1 \
+              || { echo "::error::$PKGDIR has no Packages index (opkg)"; exit 1; }
             echo "  OK   Packages index present"
           fi
 
@@ -683,12 +726,31 @@ jobs:
           rm -rf out-kmods && mkdir -p out-kmods
           test -d "$PKGDIR" || { echo "::error::$PKGDIR missing -- full kmod set not published"; exit 1; }
 
-          cp "$PKGDIR"/kmod-*.ipk out-kmods/ 2>/dev/null || true
-          cp "$PKGDIR"/Packages* out-kmods/ 2>/dev/null || true
+          # 25.12 defaults to APK (.apk + packages.adb); 24.10 used
+          # OPKG (.ipk + Packages). Detect, do not assume.
+          N_APK=$(ls "$PKGDIR"/*.apk 2>/dev/null | wc -l)
+          N_IPK=$(ls "$PKGDIR"/*.ipk 2>/dev/null | wc -l)
+          if [ "$N_APK" -gt 0 ]; then
+            PKGEXT="apk"
+          elif [ "$N_IPK" -gt 0 ]; then
+            PKGEXT="ipk"
+          else
+            echo "::error::$PKGDIR has neither .apk nor .ipk files"
+            ls -la "$PKGDIR" | head -20
+            exit 1
+          fi
+          echo "package format: .$PKGEXT  (apk=$N_APK ipk=$N_IPK)"
 
-          COUNT=$(ls out-kmods/kmod-*.ipk 2>/dev/null | wc -l)
-          echo "kmod .ipk collected: $COUNT"
-          [ "$COUNT" -ge 100 ] || { echo "::error::only $COUNT kmod .ipk -- expected a full set"; exit 1; }
+          cp "$PKGDIR"/kmod-*.$PKGEXT out-kmods/ 2>/dev/null || true
+          if [ "$PKGEXT" = "apk" ]; then
+            cp "$PKGDIR"/packages.adb out-kmods/ 2>/dev/null || true
+          else
+            cp "$PKGDIR"/Packages* out-kmods/ 2>/dev/null || true
+          fi
+
+          COUNT=$(ls out-kmods/kmod-*.$PKGEXT 2>/dev/null | wc -l)
+          echo "kmod .$PKGEXT collected: $COUNT"
+          [ "$COUNT" -ge 100 ] || { echo "::error::only $COUNT kmod .$PKGEXT -- expected a full set"; exit 1; }
 
           cp -f provenance/build-info.md out-kmods/build-info.txt
           ( cd out-kmods && find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%P\n' | sort | xargs -r sha256sum > SHA256SUMS.txt )
