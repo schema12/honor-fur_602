@@ -1017,6 +1017,39 @@ jobs:
           if-no-files-found: ignore
           overwrite: true
 
+      # ---------------------------------------------------------------- #
+      # Publish the checksums and sizes in the step summary.
+      #
+      # Artifact download requires authentication even on a public repo
+      # (GET /actions/artifacts/{id}/zip returns 401 without a token), so a
+      # reader without credentials cannot inspect SHA256SUMS.txt inside the
+      # artifact. The step summary, by contrast, is world-readable on the run
+      # page. Printing the digests here means the build output can be
+      # identified and compared without any credentials.
+      # ---------------------------------------------------------------- #
+      - name: Publish checksums to the run summary
+        if: always()
+        run: |
+          {
+            echo
+            echo "### delivered files (name, size, SHA256)"
+            echo
+            for d in out-firmware out-kmods out-rescue; do
+              [ -d "$d" ] || continue
+              echo "#### $d"
+              echo '```'
+              if [ -f "$d/SHA256SUMS.txt" ]; then
+                cat "$d/SHA256SUMS.txt"
+              else
+                ( cd "$d" && find . -maxdepth 1 -type f -printf '%P\n' | sort | xargs -r sha256sum )
+              fi
+              echo '```'
+              echo
+              echo "total files: $(find "$d" -maxdepth 1 -type f | wc -l), size: $(du -sh "$d" | cut -f1)"
+              echo
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Fail if experimental
         if: ${{ env.EXPERIMENTAL == 'true' }}
         run: |
