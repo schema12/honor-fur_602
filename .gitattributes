@@ -15,6 +15,9 @@
 
 * text=auto
 
+# This file itself, so it never gets rewritten on checkout either.
+.gitattributes      text eol=lf
+
 # Shell scripts -- must be LF, and must stay executable.
 *.sh                text eol=lf
 diy-part2*.sh       text eol=lf
