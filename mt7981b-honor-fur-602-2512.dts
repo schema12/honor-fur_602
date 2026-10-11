@@ -1,0 +1,363 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+//
+// HONOR FUR-602 / FUR-603  (a.k.a. 荣耀 XU50 / XT50 / XC50, 联通定制版)
+//   SoC   : MediaTek MT7981B (Filogic 820)
+//   RAM   : 256 MiB DDR3
+//   Flash : 128 MiB SPI-NAND, NMBM enabled
+//   WLAN  : MT7981 2.4G 2x2 + MT7976CN 5G 2x2  = AX3000
+//   ETH   : MT7531 switch, 1x 1G WAN + 3x 1G LAN, all behind gmac0
+//
+// ---------------------------------------------------------------------------
+//  ImmortalWrt 25.12.2 variant (kernel 6.12)
+// ---------------------------------------------------------------------------
+//  Baseline: immortalwrt/immortalwrt @ 4fc16f2985a358bd43bb522e43f05395fcbd6ed5
+//            (git tag v25.12.2, annotated + PGP-signed)
+//            target/linux/mediatek, subtarget filogic, KERNEL_PATCHVER 6.12
+//
+//  This file is the 25.12 counterpart of mt7981b-honor-fur-602.dts (the 24.10 /
+//  kernel-6.6 file).  Both live in the repository side by side so the 24.10
+//  workflow keeps working untouched.  Inside a build tree only ONE of them is
+//  ever installed, under the name given by DEVICE_DTS.
+//
+//  Differences from the 24.10 file -- ONLY these three, each forced by an
+//  upstream change that was verified in the locked tree:
+//
+//   1. #include "mt7981b.dtsi" instead of "mt7981.dtsi".
+//      Upstream Linux renamed the MT7981 SoC include when the SoC gained its
+//      "b" suffix; kernel 6.12 ships arch/arm64/boot/dts/mediatek/mt7981b.dtsi
+//      and no longer provides mt7981.dtsi.  Every MT7981 device in the 25.12
+//      tree (h3c-magic-nx30-pro, nokia-ea0326gmp, jcg-q30-pro, cmcc-rax3000m,
+//      mt7981-rfb, ...) includes "mt7981b.dtsi".  Without this change the DTB
+//      does not compile at all.
+//
+//   2. <dt-bindings/pinctrl/mt65xx.h> is included explicitly.
+//      MTK_DRIVE_8mA / MTK_PUPD_SET_R1R0_11 are used by the SPI pinconf below.
+//      The 5.4-era immortalwrt mt7981.dtsi pulled that header in for us; the
+//      mainline mt7981b.dtsi does not, so the 25.12 device trees that use these
+//      macros include it themselves (cf. mt7981b-h3c-magic-nx30-pro.dts).
+//
+//   3. The memory node is written as memory@40000000 with an explicit
+//      device_type = "memory", matching every MT7981 device tree in 25.12 and
+//      avoiding a dtc unit-address warning.
+//
+//  Everything else -- partition layout, NMBM, SPI calibration, factory/MAC
+//  offsets, DSA port mapping, GPIOs, LEDs, WiFi EEPROM -- is byte-for-byte the
+//  already-verified 24.10 design and is intentionally NOT touched.
+//
+//  Boot chain: unchanged.  See the long comment in the 24.10 DTS and
+//  MIGRATION-REPORT.md: the bl-mt798x U-Boot boots the FIT out of the UBI
+//  volume named "kernel" (KERNEL_IN_UBI=1), and 25.12's platform.sh still
+//  routes an unlisted board through the generic `nand_do_upgrade "$1"`
+//  fallback with nand.sh's default CI_KERNPART=kernel / CI_ROOTPART=rootfs.
+//  We therefore deliberately do NOT adopt the newer `linux,ubi` +
+//  volname="fit" + root=/dev/fit0 layout used by h3c/nokia/jcg in 25.12:
+//  that requires fitblk support in U-Boot which this board's U-Boot lacks.
+//
+// Hardware facts are taken from, and cross-checked against:
+//   1. hanwckf/bl-mt798x @ 20241115  (tag, commit 15ad0ed949043bcb)
+//        uboot-mtk-20230718-09eda825/arch/arm/dts/mt7981-honor_fur-602.dts
+//          -> gpio 0/1 (keys), gpio 8/13 (LEDs), gpio 39 (switch reset),
+//             gmac0 = 2500base-x / 2500 Mbps, "mediatek,switch = mt7531"
+//        uboot-mtk-20230718-09eda825/configs/mt7981_honor_fur-602{,_multi_layout}_defconfig
+//          -> 128 MiB SPI-NAND, NMBM
+//        uboot-mtk-20230718-09eda825/board/mediatek/common/mtd_layout.c
+//          -> mtd-layout expand(114m): bl2|u-boot-env|factory|Trace|fip|ubi(116736k)
+//   2. hanwckf/immortalwrt-mt798x @ openwrt-21.02
+//        target/linux/mediatek/files-5.4/arch/arm64/boot/dts/mediatek/mt7981-honor-fur-602.dts
+//          -> authoritative port wiring, NMBM overlay, SPI calibration data,
+//             same make/model string "HONOR FUR-602/603"
+//        target/linux/mediatek/image/mt7981.mk (Device/honor_fur-602)
+//          -> IMAGE_SIZE 116736k, KERNEL_IN_UBI, factory.bin + sysupgrade-tar
+//   3. NMBM support in the 25.12 baseline, confirmed at the locked SHA:
+//        target/linux/generic/files/drivers/mtd/nand/mtk_bmt.c
+//          -> mtk_bmt_attach(): `else if (of_property_read_bool(np, "mediatek,nmbm"))
+//             bmtd.ops = &mtk_bmt_nmbm_ops;`
+//        target/linux/mediatek/filogic/config-6.12
+//          -> CONFIG_MTD_NAND_MTK_BMT=y
+//
+// Requires the hanwckf/bl-mt798x "mt7981_honor_fur-602" U-Boot (20241115 or
+// the 20230718 build it is derived from) with the expand(114m) mtd layout.
+// The stock HONOR U-Boot is signature-locked and cannot boot this firmware.
+
+/dts-v1/;
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/pinctrl/mt65xx.h>
+
+#include "mt7981b.dtsi"
+
+/ {
+	model = "HONOR FUR-602/603";
+	compatible = "honor,fur-602", "mediatek,mt7981";
+
+	aliases {
+		serial0 = &uart0;
+		label-mac-device = &gmac0;
+		led-boot = &led_status_red;
+		led-failsafe = &led_status_red;
+		led-running = &led_status_green;
+		led-upgrade = &led_status_green;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0 0x40000000 0 0x10000000>;
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		button-reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&pio 1 GPIO_ACTIVE_LOW>;
+		};
+
+		button-mesh {
+			label = "mesh";
+			linux,code = <BTN_9>;
+			linux,input-type = <EV_SW>;
+			gpios = <&pio 0 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_status_green: green {
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&pio 8 GPIO_ACTIVE_LOW>;
+		};
+
+		led_status_red: red {
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_RED>;
+			gpios = <&pio 13 GPIO_ACTIVE_LOW>;
+		};
+	};
+};
+
+&eth {
+	status = "okay";
+
+	gmac0: mac@0 {
+		compatible = "mediatek,eth-mac";
+		reg = <0>;
+		phy-mode = "2500base-x";
+
+		nvmem-cells = <&macaddr_factory_2a>;
+		nvmem-cell-names = "mac-address";
+
+		fixed-link {
+			speed = <2500>;
+			full-duplex;
+			pause;
+		};
+	};
+};
+
+&mdio_bus {
+	switch: switch@1f {
+		compatible = "mediatek,mt7531";
+		reg = <31>;
+		reset-gpios = <&pio 39 GPIO_ACTIVE_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-parent = <&pio>;
+		interrupts = <38 IRQ_TYPE_LEVEL_HIGH>;
+	};
+};
+
+&spi0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi0_flash_pins>;
+	status = "okay";
+
+	spi_nand: spi_nand@0 {
+		compatible = "spi-nand";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0>;
+
+		spi-max-frequency = <52000000>;
+		spi-tx-bus-width = <4>;
+		spi-rx-bus-width = <4>;
+
+		/*
+		 * NMBM: matches CONFIG_ENABLE_NAND_NMBM=y in the bl-mt798x
+		 * mt7981_honor_fur-602 U-Boot, which maps the whole chip through
+		 * its own bad-block table. The BMT area is carved out of the
+		 * top of the device, so the partitions below are the *free*
+		 * area and must stay in sync with the U-Boot mtd-layout
+		 * "expand(114m)" mtdparts string.
+		 *
+		 * Verified still supported on the 25.12 baseline: mtk_bmt.c
+		 * (target/linux/generic/files/drivers/mtd/nand/) handles
+		 * "mediatek,nmbm" -> mtk_bmt_nmbm_ops, and filogic/config-6.12
+		 * carries CONFIG_MTD_NAND_MTK_BMT=y.
+		 */
+		mediatek,nmbm;
+		mediatek,bmt-max-ratio = <1>;
+		mediatek,bmt-max-reserved-blocks = <64>;
+
+		/*
+		 * SPI calibration data, taken verbatim from the hanwckf
+		 * reference DTS for this board. Without it the SPI-NAND
+		 * controller may sample at the wrong delay on this PCB.
+		 */
+		spi-cal-enable;
+		spi-cal-mode = "read-data";
+		spi-cal-datalen = <7>;
+		spi-cal-data = /bits/ 8 <0x53 0x50 0x49 0x4E 0x41 0x4E 0x44>; /* 'SPINAND' */
+		spi-cal-addrlen = <5>;
+		spi-cal-addr = /bits/ 32 <0x0 0x0 0x0 0x0 0x0>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "bl2";
+				reg = <0x0000000 0x0100000>;
+				read-only;
+			};
+
+			partition@100000 {
+				label = "u-boot-env";
+				reg = <0x0100000 0x0080000>;
+			};
+
+			factory: partition@180000 {
+				label = "factory";
+				reg = <0x0180000 0x01e0000>;
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					macaddr_factory_24: macaddr@24 {
+						reg = <0x24 0x6>;
+					};
+
+					macaddr_factory_2a: macaddr@2a {
+						reg = <0x2a 0x6>;
+					};
+				};
+			};
+
+			partition@360000 {
+				label = "trace";
+				reg = <0x0360000 0x0020000>;
+				read-only;
+			};
+
+			partition@380000 {
+				label = "fip";
+				reg = <0x0380000 0x0200000>;
+				read-only;
+			};
+
+			partition@580000 {
+				label = "ubi";
+				reg = <0x0580000 0x7200000>;
+			};
+		};
+	};
+};
+
+&switch {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			label = "wan";
+			nvmem-cells = <&macaddr_factory_24>;
+			nvmem-cell-names = "mac-address";
+		};
+
+		port@1 {
+			reg = <1>;
+			label = "lan3";
+		};
+
+		port@2 {
+			reg = <2>;
+			label = "lan2";
+		};
+
+		port@3 {
+			reg = <3>;
+			label = "lan1";
+		};
+
+		port@6 {
+			reg = <6>;
+			label = "cpu";
+			ethernet = <&gmac0>;
+			phy-mode = "2500base-x";
+
+			fixed-link {
+				speed = <2500>;
+				full-duplex;
+				pause;
+			};
+		};
+	};
+};
+
+&pio {
+	spi0_flash_pins: spi0-pins {
+		mux {
+			function = "spi";
+			groups = "spi0", "spi0_wp_hold";
+		};
+
+		conf-pu {
+			pins = "SPI0_CS", "SPI0_HOLD", "SPI0_WP";
+			drive-strength = <MTK_DRIVE_8mA>;
+			bias-pull-up = <MTK_PUPD_SET_R1R0_11>;
+		};
+
+		conf-pd {
+			pins = "SPI0_CLK", "SPI0_MOSI", "SPI0_MISO";
+			drive-strength = <MTK_DRIVE_8mA>;
+			bias-pull-down = <MTK_PUPD_SET_R1R0_11>;
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&watchdog {
+	status = "okay";
+};
+
+&wifi {
+	status = "okay";
+
+	/*
+	 * WiFi EEPROM / calibration data lives at offset 0 of the "factory"
+	 * partition. This is the de-facto MT7981 convention and matches the
+	 * hanwckf reference board support (LEDE 5.4 used the same layout).
+	 * `mediatek,mtd-eeprom` is still the supported binding on 6.12
+	 * (cf. mt7981b-jcg-q30-pro.dts / mt7981b-h3c-magic-nx30-pro.dts in the
+	 * 25.12 tree), so it is deliberately kept rather than converted to the
+	 * nvmem-cells spelling used by some newer boards.
+	 * TODO(verify-on-hardware): confirm the 2.4G/5G eeprom blobs are
+	 * actually present at 0x0 by dumping "factory" on a real unit.
+	 */
+	mediatek,mtd-eeprom = <&factory 0x0>;
+};

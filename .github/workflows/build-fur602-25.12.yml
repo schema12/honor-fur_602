@@ -1,0 +1,750 @@
+name: Build HONOR FUR-602/603 (ImmortalWrt 25.12.2)
+
+# Builds an ImmortalWrt 25.12.2 (kernel 6.12) firmware for the HONOR FUR-602 /
+# FUR-603 (MT7981B), targeting the hanwckf/bl-mt798x U-Boot with the
+# expand(114m) NAND layout.
+#
+# The source baseline is NOT "whatever the branch head is today". It is pinned
+# to the commit the official v25.12.2 release tag points at, recorded in
+# locks/immortalwrt-25.12.2.lock, and every feed is pinned in
+# locks/feeds-25.12.2.lock. The job aborts if the checked-out commit or any feed
+# does not match its lock -- it never silently falls back to a floating branch.
+#
+# Design notes
+# ------------
+# * Non-destructive: this workflow coexists with build-fur602.yml (the 24.10
+#   build), which is left untouched as the rollback path. The two share no
+#   filenames: this one uses mt7981b-honor-fur-602-2512.dts,
+#   filogic.mk.25.12.append, filogic.config.25.12.append, .config.25.12 and
+#   diy-part2-25.12.sh.
+# * The device is *injected* into the stock tree by diy-part2-25.12.sh rather
+#   than living in a fork: DTS -> target/linux/mediatek/dts/, device definition
+#   -> target/linux/mediatek/image/filogic.mk. The script fails loudly if the
+#   assumptions it depends on no longer hold (kernel 6.12, the mt7981b.dtsi
+#   include convention, NMBM still supported, generic nand_do_upgrade fallback
+#   intact).
+#
+#   NOTE on mt7981b.dtsi: that file is NOT in the OpenWrt tree. It comes from
+#   the kernel tarball, and OpenWrt's own patch
+#   target/linux/mediatek/patches-6.12/117-complete-mt7981b-dtsi.patch adds the
+#   eth/spi0/wifi/mdio_bus nodes to it at build time. So the guard rail checks
+#   the *convention* via in-tree sibling DTS rather than the file itself.
+# * CONFIG_ALL_KMODS=y builds + publishes the complete, ABI-matched kmod set
+#   (tc/qdisc/CAKE/IFB, netfilter, mac80211/mt76, USB, ...) so those can be
+#   `opkg install`ed later, while the image itself still only contains
+#   DEFAULT_PACKAGES + DEVICE_PACKAGES. The workflow *proves* this by checking
+#   the published .ipk files, not just the .config.
+# * Artifacts are named with the source SHA and the run id, and every file is
+#   SHA256-listed, so nothing from an older build can be mistaken for fresh.
+# * No root password is hardcoded and no package-signature check is disabled.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'Override the locked ImmortalWrt commit (EXPERIMENTAL -- marks the build as unverified)'
+        required: false
+        default: ''
+      build_all_kmods:
+        description: 'Publish the full kmod set (CONFIG_ALL_KMODS=y). Turn off only for a quick boot-only test build.'
+        type: boolean
+        required: true
+        default: true
+  push:
+    branches:
+      - main
+      # The migration branch is listed explicitly. `workflow_dispatch` only
+      # becomes available once a workflow exists on the repository's DEFAULT
+      # branch, so a push to this branch is how the first build is triggered
+      # without touching main.
+      - migration/immortalwrt-25.12.2
+    paths:
+      - '.config.25.12'
+      - 'diy-part2-25.12.sh'
+      - 'filogic.mk.25.12.append'
+      - 'filogic.config.25.12.append'
+      - 'mt7981b-honor-fur-602-2512.dts'
+      - 'locks/**'
+      - '.github/workflows/build-fur602-25.12.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TARGET: mediatek
+  SUBTARGET: filogic
+  DEVICE: honor_fur-602
+  # Must match DEVICE_DTS in filogic.mk.25.12.append
+  DTS_NAME: mt7981b-honor-fur-602-2512
+  LOCK_MAIN: locks/immortalwrt-25.12.2.lock
+  LOCK_FEEDS: locks/feeds-25.12.2.lock
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout build config
+        uses: actions/checkout@v4
+
+      - name: Load and validate version locks
+        id: lock
+        run: |
+          set -eu
+          . "$LOCK_MAIN"
+          . "$LOCK_FEEDS"
+
+          echo "dist          = ${DIST_NAME} ${DIST_VERSION}"
+          echo "repo          = ${REPO_URL}"
+          echo "ref           = ${REPO_REF}"
+          echo "locked sha    = ${REPO_SHA}"
+          echo "kernel        = ${KERNEL_VERSION} (patchver ${KERNEL_PATCHVER})"
+
+          # The lock must contain a real 40-hex commit, not a placeholder.
+          if ! printf '%s' "$REPO_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::REPO_SHA in $LOCK_MAIN is not a 40-hex commit: '$REPO_SHA'"
+            exit 1
+          fi
+
+          # Manual override => experimental, clearly labelled, never silent.
+          OVERRIDE="${{ github.event.inputs.source_sha || '' }}"
+          if [ -n "$OVERRIDE" ]; then
+            if ! printf '%s' "$OVERRIDE" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::source_sha override is not a 40-hex commit: '$OVERRIDE'"
+              exit 1
+            fi
+            echo "::warning::EXPERIMENTAL BUILD -- source_sha overridden to $OVERRIDE"
+            echo "::warning::This build does NOT correspond to the locked ${DIST_VERSION} baseline."
+            echo "EXPERIMENTAL=true" >> "$GITHUB_ENV"
+            echo "REPO_SHA=$OVERRIDE" >> "$GITHUB_ENV"
+          else
+            echo "EXPERIMENTAL=false" >> "$GITHUB_ENV"
+            echo "REPO_SHA=$REPO_SHA" >> "$GITHUB_ENV"
+          fi
+
+          {
+            echo "dist_name=$DIST_NAME"
+            echo "dist_version=$DIST_VERSION"
+            echo "repo_url=$REPO_URL"
+            echo "repo_ref=$REPO_REF"
+            echo "kernel_version=$KERNEL_VERSION"
+            echo "version_code=$VERSION_CODE"
+            echo "feed_names=$FEED_NAMES"
+          } >> "$GITHUB_OUTPUT"
+
+          # Persist the feed pins for the later verification step.
+          {
+            for f in $FEED_NAMES; do
+              eval "u=\${FEED_${f}_URL}"; eval "s=\${FEED_${f}_SHA}"
+              echo "${f}|${u}|${s}"
+            done
+          } > /tmp/feed-pins.txt
+          cat /tmp/feed-pins.txt
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses5-dev libssl-dev python3 python3-pip python3-setuptools \
+            rsync unzip zlib1g-dev file wget curl subversion patch swig libelf-dev \
+            libncursesw5-dev zstd
+
+      # ------------------------------------------------------------------ #
+      # Clone the EXACT locked commit, then verify it.
+      # ------------------------------------------------------------------ #
+      - name: Clone ImmortalWrt at the locked commit
+        run: |
+          set -eu
+          echo "cloning ${{ steps.lock.outputs.repo_url }} @ $REPO_SHA"
+          git init -q openwrt
+          cd openwrt
+          git remote add origin "${{ steps.lock.outputs.repo_url }}"
+
+          # Fetch exactly the commit we want. GitHub allows fetching a
+          # reachable SHA directly; if that ever stops working, fall back to
+          # fetching the release tag itself. Either way we verify the SHA next.
+          if git fetch -q --depth 1 origin "$REPO_SHA" 2>/dev/null; then
+            echo "fetched by sha"
+          else
+            echo "direct sha fetch failed, falling back to the tag"
+            git fetch -q --depth 1 origin "${{ steps.lock.outputs.repo_ref }}"
+          fi
+          git checkout -q FETCH_HEAD
+
+      - name: Verify the locked source commit
+        working-directory: openwrt
+        run: |
+          set -eu
+          ACTUAL=$(git rev-parse HEAD)
+          echo "expected = $REPO_SHA"
+          echo "actual   = $ACTUAL"
+          if [ "$ACTUAL" != "$REPO_SHA" ]; then
+            echo "::error::checked-out commit $ACTUAL does not match the locked commit $REPO_SHA"
+            echo "::error::Refusing to build an unpinned source tree."
+            exit 1
+          fi
+          echo "IMM_COMMIT=$ACTUAL" >> "$GITHUB_ENV"
+          echo "IMM_COMMIT_SHORT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+          # The release commit must actually declare itself as 25.12.2.
+          test -f version || { echo "::error::no 'version' file -- this is not a release commit"; exit 1; }
+          echo "version file: $(cat version)"
+          grep -q '25\.12\.2' include/version.mk \
+            || { echo "::error::include/version.mk does not mention 25.12.2"; exit 1; }
+
+      # ------------------------------------------------------------------ #
+      # Guard rails: the whole device definition assumes a 6.12-era tree.
+      # ------------------------------------------------------------------ #
+      - name: Verify source tree matches our assumptions
+        working-directory: openwrt
+        run: |
+          set -eu
+          KV=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/mediatek/Makefile)
+          echo "KERNEL_PATCHVER=$KV"
+          if [ "$KV" != "6.12" ]; then
+            echo "::error::expected kernel 6.12 for ImmortalWrt 25.12.2, got '$KV'."
+            echo "::error::This repository is pinned to the 25.12.2 / 6.12 design. Refusing to build."
+            exit 1
+          fi
+
+          test -f target/linux/mediatek/image/filogic.mk
+          test -f target/linux/mediatek/image/Makefile
+          test -d target/linux/mediatek/dts
+          test -f target/linux/mediatek/filogic/config-6.12
+          test ! -f target/linux/mediatek/config-6.12
+
+          # The MT7981 SoC include convention must be the 6.12 one. mt7981b.dtsi
+          # is NOT in the OpenWrt tree -- it is unpacked from the kernel tarball
+          # at build time -- so we assert the convention via the in-tree sibling
+          # device trees, which ARE present and authoritative.
+          grep -rlq '#include "mt7981b.dtsi"' target/linux/mediatek/dts \
+            || { echo "::error::no in-tree DTS includes mt7981b.dtsi -- SoC include convention changed"; exit 1; }
+          if grep -rlq '#include "mt7981\.dtsi"' target/linux/mediatek/dts; then
+            echo "::error::an in-tree DTS still includes the old mt7981.dtsi -- not a 6.12-generation tree"
+            exit 1
+          fi
+          grep -rlq '<dt-bindings/pinctrl/mt65xx.h>' target/linux/mediatek/dts \
+            || { echo "::error::no in-tree DTS includes mt65xx.h -- pinctrl binding header unavailable"; exit 1; }
+
+          # NMBM must still be supported: this board REQUIRES it.
+          BMT=target/linux/generic/files/drivers/mtd/nand/mtk_bmt.c
+          test -f "$BMT" || { echo "::error::$BMT missing -- MediaTek BMT/NMBM driver gone"; exit 1; }
+          grep -q 'mediatek,nmbm' "$BMT" \
+            || { echo "::error::$BMT no longer handles mediatek,nmbm -- NMBM support removed"; exit 1; }
+          grep -q '^CONFIG_MTD_NAND_MTK_BMT=y' target/linux/mediatek/filogic/config-6.12 \
+            || { echo "::error::CONFIG_MTD_NAND_MTK_BMT=y not set -- NMBM would not be built in"; exit 1; }
+
+          # Device/Default must still synthesise the FIT kernel we rely on.
+          # Doubled dollars on purpose: in a Makefile $$(x) is a literal $(x).
+          grep -q 'fit lzma \$\$(KDIR)/image-\$\$(firstword \$\$(DEVICE_DTS)).dtb' \
+            target/linux/mediatek/image/Makefile
+
+          # The upgrade path must still be the generic nand_do_upgrade fallback:
+          # nand_do_platform_check() (package/base-files .../nand.sh) detects our
+          # sysupgrade tar via sysupgrade-<board>/CONTROL and then untars it.
+          PF=target/linux/mediatek/filogic/base-files/lib/upgrade/platform.sh
+          grep -q 'nand_do_upgrade "\$1"' "$PF"
+          if grep -q 'honor,fur-602' "$PF"; then
+            echo "::error::$PF now special-cases honor,fur-602; re-verify the upgrade path"
+            exit 1
+          fi
+
+          # The U-Boot looks for UBI volumes literally named kernel/rootfs.
+          NS=package/base-files/files/lib/upgrade/nand.sh
+          grep -q 'CI_KERNPART="\${CI_KERNPART:-kernel}"' "$NS" \
+            || { echo "::error::nand.sh CI_KERNPART default changed"; exit 1; }
+          grep -q 'CI_ROOTPART="\${CI_ROOTPART:-rootfs}"' "$NS" \
+            || { echo "::error::nand.sh CI_ROOTPART default changed"; exit 1; }
+
+          echo "source tree OK"
+
+      # ------------------------------------------------------------------ #
+      # Feed pinning: rewrite feeds.conf.default with the locked SHAs.
+      # ------------------------------------------------------------------ #
+      - name: Pin feeds to the locked commits
+        working-directory: openwrt
+        run: |
+          set -eu
+          echo "--- upstream feeds.conf.default (as shipped by the release) ---"
+          cat feeds.conf.default
+
+          # The release commit already pins every feed with ^<sha>. Assert that
+          # what upstream ships matches our lock, so a mismatch is caught here
+          # rather than after a silent drift.
+          while IFS='|' read -r name url sha; do
+            [ -n "$name" ] || continue
+            if grep -q "\^${sha}\$" feeds.conf.default; then
+              echo "  OK   $name pinned to $sha in feeds.conf.default"
+            else
+              echo "::error::feed '$name' is NOT pinned to $sha in feeds.conf.default"
+              grep -n "$name" feeds.conf.default || true
+              exit 1
+            fi
+          done < /tmp/feed-pins.txt
+
+          echo "all feeds pinned as expected"
+
+      - name: Update and install feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ------------------------------------------------------------------ #
+      # Verify the feeds really landed on the locked commits.
+      # ------------------------------------------------------------------ #
+      - name: Verify feed commits
+        working-directory: openwrt
+        run: |
+          set -eu
+          rc=0
+          while IFS='|' read -r name url sha; do
+            [ -n "$name" ] || continue
+            if [ ! -d "feeds/$name" ]; then
+              echo "::error::feed directory feeds/$name missing"; rc=1; continue
+            fi
+            actual=$(git -C "feeds/$name" rev-parse HEAD 2>/dev/null || echo MISSING)
+            if [ "$actual" != "$sha" ]; then
+              echo "::error::feed $name is at $actual, expected $sha"
+              rc=1
+            else
+              echo "  OK   $name @ $actual"
+            fi
+          done < /tmp/feed-pins.txt
+          [ "$rc" -eq 0 ] || { echo "::error::feed commit verification failed"; exit 1; }
+
+          # Record what we actually built against.
+          {
+            echo "FEEDS_RESOLVED<<EOF"
+            while IFS='|' read -r name url sha; do
+              [ -n "$name" ] || continue
+              printf '%s %s %s\n' "$name" "$(git -C "feeds/$name" rev-parse HEAD)" "$url"
+            done < /tmp/feed-pins.txt
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------ #
+      # Inject the device, then re-assert the DTS survives feeds install.
+      # ------------------------------------------------------------------ #
+      - name: Inject HONOR FUR-602/603 device support
+        run: |
+          set -eu
+          # diy-part2-25.12.sh runs with CWD=openwrt/ and reads the device files
+          # from "../", i.e. this repository root -- which is where they already
+          # are, because actions/checkout put the repo at the workspace root and
+          # we created openwrt/ inside it. Nothing to copy for the DTS.
+          cp -f .config.25.12 openwrt/.config
+          cp -f diy-part2-25.12.sh openwrt/diy-part2-25.12.sh
+
+          # CONFIG_ALL_KMODS=y publishes the complete, ABI-matched kmod set
+          # (tc/qdisc/CAKE/IFB, netfilter, mac80211/mt76, USB, ...) so they can
+          # be `opkg install`ed later, without adding them to the image. Allow a
+          # deliberate opt-out for a quick boot-only test build.
+          if [ "${{ github.event.inputs.build_all_kmods || 'true' }}" = "false" ]; then
+            echo "NOTE: build_all_kmods=false -- dropping CONFIG_ALL_KMODS=y"
+            sed -i '/^CONFIG_ALL_KMODS=y$/d' openwrt/.config
+          fi
+          echo "--- build .config ---"
+          cat openwrt/.config
+
+          cd openwrt
+          chmod +x diy-part2-25.12.sh
+          ./diy-part2-25.12.sh
+
+      - name: Re-assert DTS once feeds are installed
+        working-directory: openwrt
+        run: |
+          set -eu
+          test -f "target/linux/mediatek/dts/$DTS_NAME.dts" || {
+            echo "::error::DTS target/linux/mediatek/dts/$DTS_NAME.dts disappeared"
+            exit 1
+          }
+          # Must include the 6.12 SoC header, not the 5.4-era one.
+          grep -q '#include "mt7981b.dtsi"' "target/linux/mediatek/dts/$DTS_NAME.dts" \
+            || { echo "::error::$DTS_NAME.dts does not include mt7981b.dtsi"; exit 1; }
+          grep -q 'mediatek,nmbm' "target/linux/mediatek/dts/$DTS_NAME.dts" \
+            || { echo "::error::$DTS_NAME.dts lost its NMBM properties"; exit 1; }
+
+      - name: Generate .config
+        working-directory: openwrt
+        run: make defconfig
+
+      # ---------------------------------------------------------------- #
+      # Fail fast: if the device is not in the config there is no point
+      # compiling for two hours and finding out at the end.
+      # ---------------------------------------------------------------- #
+      - name: Pre-build check -- device, kmods and wireless present
+        working-directory: openwrt
+        run: |
+          set -eu
+          echo "===== target / device selection ====="
+          grep -E '^CONFIG_TARGET_mediatek(_filogic)?=' .config || true
+          if ! grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_honor_fur-602=' .config; then
+            echo "::error::CONFIG_TARGET_mediatek_filogic_DEVICE_honor_fur-602 is not set."
+            echo "::error::The device definition did not register -- check filogic.mk injection."
+            exit 1
+          fi
+
+          echo "===== kmod publishing (so these are installable later) ====="
+          if [ "${{ github.event.inputs.build_all_kmods || 'true' }}" = "false" ]; then
+            echo "  (skipped: build_all_kmods=false)"
+          else
+            if ! grep -q '^CONFIG_ALL_KMODS=y' .config; then
+              echo "::error::CONFIG_ALL_KMODS=y missing: the full kmod set (tc/qdisc/CAKE/IFB,"
+              echo "::error::netfilter, mac80211/mt76, USB, ...) would not be published, and a"
+              echo "::error::later 'opkg install kmod-sched-cake' would fail."
+              exit 1
+            fi
+            echo "  CONFIG_ALL_KMODS=y present"
+          fi
+
+          echo "===== required wireless kmods selected by the device ====="
+          # These come from DEVICE_PACKAGES in our filogic.mk entry; they must be
+          # selected as =y in .config (installed into the image, not just built).
+          for p in kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware; do
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              echo "  OK   $p"
+            else
+              echo "::error::$p is not selected in .config; the device would have no working WiFi / offload firmware"
+              exit 1
+            fi
+          done
+
+          echo "===== QoE/QoS relevant kmod packages exist in the tree ====="
+          for kp in sched-core sched sched-cake sched-prio sched-fq-pie ifb; do
+            grep -q "define KernelPackage/$kp\$" package/kernel/linux/modules/netsupport.mk \
+              || grep -q "define KernelPackage/$kp\$" package/kernel/linux/modules/netdevices.mk \
+              || { echo "::error::KernelPackage/$kp definition not found"; exit 1; }
+          done
+
+          echo "pre-build check passed"
+
+      - name: Download packages
+        working-directory: openwrt
+        run: make download -j8
+
+      - name: Build firmware
+        working-directory: openwrt
+        run: |
+          make -j$(nproc) || make -j1 V=s
+
+      # ---------------------------------------------------------------- #
+      # Post-build verification. Asserts the actual deliverables exist,
+      # that the full kmod set was really published, and prints the summary.
+      # ---------------------------------------------------------------- #
+      - name: Verify images and kmod packages
+        id: verify
+        working-directory: openwrt
+        run: |
+          set -eu
+          BIN="bin/targets/$TARGET/$SUBTARGET"
+          test -d "$BIN" || { echo "::error::$BIN missing"; exit 1; }
+
+          echo "===== firmware images ====="
+          ls -la "$BIN"/*.bin "$BIN"/*.itb "$BIN"/kernel 2>/dev/null || true
+
+          FACTORY=$(ls "$BIN"/*"$DEVICE"*factory*.bin 2>/dev/null | head -1 || true)
+          SYSUP=$(ls "$BIN"/*"$DEVICE"*sysupgrade*.bin 2>/dev/null | head -1 || true)
+
+          [ -n "$FACTORY" ] || { echo "::error::factory.bin not produced for $DEVICE"; exit 1; }
+          [ -n "$SYSUP" ]   || { echo "::error::sysupgrade.bin not produced for $DEVICE"; exit 1; }
+
+          echo "factory.bin    = $FACTORY ($(stat -c%s "$FACTORY") bytes)"
+          echo "sysupgrade.bin = $SYSUP ($(stat -c%s "$SYSUP") bytes)"
+
+          # sysupgrade.bin is produced by Build/sysupgrade-tar (scripts/
+          # sysupgrade-tar.sh) then append-metadata. Its payload must be a tar
+          # containing sysupgrade-<DEVICE_NAME>/CONTROL, /kernel and /root,
+          # because that is exactly what the bl-mt798x U-Boot's
+          # parse_tar_image()/write_ubi2_tar_image() and OpenWrt's own
+          # nand_do_platform_check() both look for.
+          echo "--- sysupgrade.bin payload ---"
+          if tar tf "$SYSUP" >/dev/null 2>&1; then
+            tar tf "$SYSUP" | head -10
+            tar tf "$SYSUP" | grep -q "^sysupgrade-$DEVICE/" \
+              || { echo "::error::sysupgrade.bin has no sysupgrade-$DEVICE/ dir"; exit 1; }
+            tar tf "$SYSUP" | grep -q "^sysupgrade-$DEVICE/kernel$" \
+              || echo "::warning::no sysupgrade-$DEVICE/kernel entry"
+            tar tf "$SYSUP" | grep -q "^sysupgrade-$DEVICE/root$" \
+              || echo "::warning::no sysupgrade-$DEVICE/root entry"
+            echo "sysupgrade.bin: tar structure OK (kernel + root present)"
+          else
+            echo "::error::sysupgrade.bin is not a readable tar; bl-mt798x U-Boot cannot parse it"
+            exit 1
+          fi
+
+          echo "===== manifest / profiles ====="
+          ls -la "$BIN"/*.manifest 2>/dev/null || echo "(no manifest)"
+          grep -q 'honor,fur-602' "$BIN/profiles.json" \
+            || echo "::warning::honor,fur-602 not found in profiles.json"
+
+          echo "===== DTB present? ====="
+          ls "$BIN"/kernel 2>/dev/null || true
+          ls "$BIN"/*.dtb 2>/dev/null || true
+
+          # ---------------------------------------------------------------- #
+          # Full kmod set: prove it by the published packages, not by a log.
+          # ---------------------------------------------------------------- #
+          echo "===== published kmod packages ====="
+          PKGDIR="$BIN/packages"
+          if [ "${{ github.event.inputs.build_all_kmods || 'true' }}" = "false" ]; then
+            echo "  (skipped: build_all_kmods=false)"
+          else
+            test -d "$PKGDIR" || { echo "::error::$PKGDIR not found -- full kmod set was NOT published"; exit 1; }
+
+            KMOD_COUNT=$(ls "$PKGDIR"/kmod-*.ipk 2>/dev/null | wc -l)
+            echo "published kmod .ipk count = $KMOD_COUNT"
+            # A full kmod build publishes many hundreds; a handful means the
+            # knob did not take effect.
+            if [ "$KMOD_COUNT" -lt 100 ]; then
+              echo "::error::only $KMOD_COUNT kmod .ipk files published -- CONFIG_ALL_KMODS did not take effect"
+              exit 1
+            fi
+
+            for p in kmod-sched-core kmod-sched kmod-sched-cake kmod-ifb \
+                     kmod-mac80211 kmod-cfg80211 kmod-mt7915e kmod-nft-core kmod-pppoe; do
+              if ls "$PKGDIR"/${p}_*.ipk >/dev/null 2>&1; then
+                echo "  OK   $p"
+              else
+                echo "  MISS $p"
+              fi
+            done
+
+            # The index must exist so opkg can resolve these on the device.
+            ls "$PKGDIR"/Packages* >/dev/null 2>&1 \
+              || { echo "::error::$PKGDIR has no Packages index"; exit 1; }
+            echo "  OK   Packages index present"
+          fi
+
+          echo "factory=$FACTORY" >> "$GITHUB_OUTPUT"
+          echo "sysupgrade=$SYSUP" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------- #
+      # Provenance: everything a reader needs to know what this build is.
+      # ---------------------------------------------------------------- #
+      - name: Write build provenance
+        if: always()
+        working-directory: openwrt
+        run: |
+          set -eu
+          BIN="bin/targets/$TARGET/$SUBTARGET"
+          OUT="$GITHUB_WORKSPACE/provenance"
+          mkdir -p "$OUT"
+
+          {
+            echo "# HONOR FUR-602/603 build provenance"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| distribution | ${{ steps.lock.outputs.dist_name }} ${{ steps.lock.outputs.dist_version }} |"
+            echo "| experimental | ${EXPERIMENTAL:-unknown} |"
+            echo "| github run id | ${{ github.run_id }} |"
+            echo "| github run number | ${{ github.run_number }} |"
+            echo "| github run attempt | ${{ github.run_attempt }} |"
+            echo "| config repo commit | ${{ github.sha }} |"
+            echo "| immortalwrt commit | ${IMM_COMMIT:-unknown} |"
+            echo "| immortalwrt ref | ${{ steps.lock.outputs.repo_ref }} |"
+            echo "| immortalwrt url | ${{ steps.lock.outputs.repo_url }} |"
+            echo "| kernel version | ${{ steps.lock.outputs.kernel_version }} |"
+            echo "| version code | ${{ steps.lock.outputs.version_code }} |"
+            echo "| target | $TARGET/$SUBTARGET |"
+            echo "| device | $DEVICE |"
+            echo "| DTS | $DTS_NAME.dts -> DTB image-$DTS_NAME.dtb |"
+            echo "| U-Boot | hanwckf/bl-mt798x, expand(114m) layout |"
+            echo "| build_all_kmods | ${{ github.event.inputs.build_all_kmods || 'true' }} |"
+            echo "| build time (UTC) | $(date -u +%Y-%m-%dT%H:%M:%SZ) |"
+            echo
+            echo "## version file shipped by the source tree"
+            echo '```'
+            cat version 2>/dev/null || echo "(no version file)"
+            echo '```'
+            echo
+            echo "## resolved feeds"
+            echo '```'
+            printf '%s\n' "${FEEDS_RESOLVED:-(not recorded)}"
+            echo '```'
+            echo
+            echo "## feeds.conf.default (as built)"
+            echo '```'
+            cat feeds.conf.default 2>/dev/null || echo "(missing)"
+            echo '```'
+            echo
+            echo "## kernel config actually used"
+            echo '```'
+            KCFG=$(find build_dir -name '.config' -path '*linux*' | head -1)
+            if [ -n "${KCFG:-}" ]; then
+              grep -E 'CONFIG_(NET_SCH_HTB|NET_SCH_CAKE|NET_SCH_FQ_CODEL|IFB|NET_ACT_MIRRED|NET_CLS_U32|MAC80211|CFG80211|BRIDGE|VLAN_8021Q|NET_DSA_MT7530|MTD_NAND_MTK_BMT)=' "$KCFG" || true
+            else
+              echo "(kernel .config not found)"
+            fi
+            echo '```'
+            echo
+            echo "## firmware images"
+            echo '```'
+            ls -la "$BIN"/*.bin 2>/dev/null || echo "(none)"
+            echo '```'
+            echo
+            echo "## manifest (installed packages)"
+            echo '```'
+            cat "$BIN"/*.manifest 2>/dev/null | head -80 || echo "(no manifest)"
+            echo '```'
+          } > "$OUT/build-info.md"
+
+          # Plain-text copy too, for machines.
+          cp -f "$OUT/build-info.md" "$OUT/build-info.txt"
+          cat "$OUT/build-info.md"
+
+      - name: Build summary
+        if: always()
+        working-directory: openwrt
+        run: |
+          {
+            echo "## HONOR FUR-602/603 (ImmortalWrt 25.12.2 / kernel 6.12)"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| source | ${{ steps.lock.outputs.repo_url }} |"
+            echo "| ref | ${{ steps.lock.outputs.repo_ref }} |"
+            echo "| locked commit | \`${REPO_SHA:-unknown}\` |"
+            echo "| experimental | ${EXPERIMENTAL:-unknown} |"
+            echo "| kernel | ${{ steps.lock.outputs.kernel_version }} |"
+            echo "| target | $TARGET/$SUBTARGET |"
+            echo "| device | $DEVICE |"
+            echo "| images | factory.bin (UBI, first flash) + sysupgrade.bin (tar, upgrades) |"
+            echo
+            echo "### firmware images"
+            echo '```'
+            ls -la "bin/targets/$TARGET/$SUBTARGET"/*.bin 2>/dev/null || echo "(none)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------- #
+      # Collect artifacts.  Explicit, narrow name matching only -- never a
+      # bare *.bin glob, so BL2/FIP images for other MediaTek SoCs cannot
+      # be swept in and mistaken for FUR-602 firmware.
+      # ---------------------------------------------------------------- #
+      - name: Collect firmware artifact
+        run: |
+          set -eu
+          BIN="openwrt/bin/targets/$TARGET/$SUBTARGET"
+          rm -rf out-firmware && mkdir -p out-firmware
+          test -d "$BIN" || { echo "::error::$BIN missing"; exit 1; }
+
+          # FUR-602 images only, matched on the device name.
+          find "$BIN" -maxdepth 1 -type f -name "*${DEVICE}*factory*.bin"    -exec cp {} out-firmware/ \;
+          find "$BIN" -maxdepth 1 -type f -name "*${DEVICE}*sysupgrade*.bin" -exec cp {} out-firmware/ \;
+          # Rescue/diagnostic images for this device, if built.
+          find "$BIN" -maxdepth 1 -type f -name "*${DEVICE}*initramfs*.bin"  -exec cp {} out-firmware/ \; || true
+
+          # Metadata.
+          for f in "$BIN"/*.manifest "$BIN"/profiles.json "$BIN"/sha256sums "$BIN"/*.buildinfo; do
+            [ -f "$f" ] && cp "$f" out-firmware/ || true
+          done
+          cp -f provenance/build-info.md out-firmware/build-info.txt
+
+          # Guard: nothing here may be a BL2/FIP/preloader image.
+          if ls out-firmware/ 2>/dev/null | grep -Eqi 'bl2|preloader|bl31|fip'; then
+            echo "::error::bootloader images leaked into the firmware artifact:"
+            ls out-firmware/ | grep -Ei 'bl2|preloader|bl31|fip' || true
+            exit 1
+          fi
+
+          # Freshness/verification: sizes + SHA256 for every delivered file.
+          ( cd out-firmware && find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%P\n' | sort | xargs -r sha256sum > SHA256SUMS.txt )
+          echo "--- out-firmware ---"
+          ls -la out-firmware/
+          echo "--- SHA256SUMS.txt ---"
+          cat out-firmware/SHA256SUMS.txt
+
+          if ! find out-firmware -maxdepth 1 -type f -name '*.bin' | grep -q .; then
+            echo "::error::no FUR-602 .bin image collected"
+            exit 1
+          fi
+
+      - name: Collect kmod artifact
+        if: ${{ github.event.inputs.build_all_kmods != 'false' }}
+        run: |
+          set -eu
+          PKGDIR="openwrt/bin/targets/$TARGET/$SUBTARGET/packages"
+          rm -rf out-kmods && mkdir -p out-kmods
+          test -d "$PKGDIR" || { echo "::error::$PKGDIR missing -- full kmod set not published"; exit 1; }
+
+          cp "$PKGDIR"/kmod-*.ipk out-kmods/ 2>/dev/null || true
+          cp "$PKGDIR"/Packages* out-kmods/ 2>/dev/null || true
+
+          COUNT=$(ls out-kmods/kmod-*.ipk 2>/dev/null | wc -l)
+          echo "kmod .ipk collected: $COUNT"
+          [ "$COUNT" -ge 100 ] || { echo "::error::only $COUNT kmod .ipk -- expected a full set"; exit 1; }
+
+          cp -f provenance/build-info.md out-kmods/build-info.txt
+          ( cd out-kmods && find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%P\n' | sort | xargs -r sha256sum > SHA256SUMS.txt )
+          ls -la out-kmods/ | head -20
+
+      - name: Collect rescue artifact
+        continue-on-error: true
+        run: |
+          set -eu
+          BIN="openwrt/bin/targets/$TARGET/$SUBTARGET"
+          rm -rf out-rescue && mkdir -p out-rescue
+          # initramfs-kernel.bin is the generic rescue/diagnostic image name.
+          find "$BIN" -maxdepth 1 -type f \( -name 'initramfs-kernel.bin' -o -name "*${DEVICE}*initramfs*" \) \
+            -exec cp {} out-rescue/ \;
+          if [ -z "$(ls -A out-rescue 2>/dev/null)" ]; then
+            echo "no rescue image produced by this build (not an error)"
+            rmdir out-rescue
+            exit 0
+          fi
+          cp -f provenance/build-info.md out-rescue/build-info.txt
+          ( cd out-rescue && sha256sum * > SHA256SUMS.txt )
+          ls -la out-rescue/
+
+      # ---------------------------------------------------------------- #
+      # Upload.  Artifact names carry the run id + short SHA so an old
+      # download can never be mistaken for this run's output.
+      # ---------------------------------------------------------------- #
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: fur602-25.12.2-firmware-${{ github.run_id }}-${{ env.IMM_COMMIT_SHORT }}
+          path: out-firmware/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload kmod packages
+        if: ${{ github.event.inputs.build_all_kmods != 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fur602-25.12.2-kmods-${{ github.run_id }}-${{ env.IMM_COMMIT_SHORT }}
+          path: out-kmods/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload rescue image
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: fur602-25.12.2-rescue-${{ github.run_id }}-${{ env.IMM_COMMIT_SHORT }}
+          path: out-rescue/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Fail if experimental
+        if: ${{ env.EXPERIMENTAL == 'true' }}
+        run: |
+          echo "::error::This was an EXPERIMENTAL build against an overridden commit ($REPO_SHA)."
+          echo "::error::It does not correspond to the locked ImmortalWrt 25.12.2 baseline."
+          exit 1

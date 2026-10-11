@@ -1,0 +1,13 @@
+CONFIG_TARGET_mediatek=y
+CONFIG_TARGET_mediatek_filogic=y
+CONFIG_TARGET_mediatek_filogic_DEVICE_honor_fur-602=y
+CONFIG_TARGET_PER_DEVICE_ROOTFS=y
+# Build + publish the COMPLETE kmod set so extra modules (tc/qdisc/CAKE/IFB,
+# netfilter, mac80211/mt76, USB, ...) can be `opkg install`ed later against a
+# matching kernel ABI, without adding them to the image.
+#
+# This is a tristate knob: it flips every kmod package from its default `n` to
+# `m` (built + published as .ipk) but does NOT install them into the rootfs --
+# only DEFAULT_PACKAGES + DEVICE_PACKAGES are installed. It is deliberately NOT
+# CONFIG_ALL=y.
+CONFIG_ALL_KMODS=y

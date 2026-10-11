@@ -1,0 +1,37 @@
+--- a/target/linux/mediatek/filogic/base-files/etc/board.d/02_network
++++ b/target/linux/mediatek/filogic/base-files/etc/board.d/02_network
+@@
+ # 25.12.2 context (immortalwrt/immortalwrt @ 4fc16f2985a358bd43bb522e43f05395fcbd6ed5)
+ #
+ # mediatek_setup_interfaces() has NO catch-all that fits a 3-port device:
+ # the final default arm is
+ #
+ #	*)
+ #		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" wan
+ #		;;
+ #
+ # Our DTS exposes only wan + lan1 + lan2 + lan3, so the default arm would
+ # build a LAN bridge over a non-existent "lan4" (the bridge would come up but
+ # that port would never appear, and the LAN list would not match the silkscreen).
+ #
+ # We therefore add a DEDICATED arm -- rather than joining an existing vendor
+ # group -- because group membership changes between releases and a dedicated
+ # arm is unambiguous. `honor,fur-602` is unique, so its position is irrelevant.
+ #
+ # MAC addresses need no board.d change: gmac0 takes factory@0x2a and switch
+ # port@0 (wan) takes factory@0x24 via nvmem cells in the DTS.
+ #
+ # NOTE: this diff is illustrative -- diy-part2-25.12.sh performs the same edit
+ # programmatically and asserts the result. Apply ONE of the two, not both.
+ #
+@@ -93,6 +93,11 @@ mediatek_setup_interfaces()
+ 		ucidef_set_interfaces_lan_wan "lan2 lan3 lan4" wan
+ 		;;
++	honor,fur-602)
++		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" wan
++		;;
+ 	*)
+ 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" wan
+ 		;;
+ 	esac
+ }
