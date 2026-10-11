@@ -34,6 +34,11 @@ diy-part2*.sh       text eol=lf
 *.dts               text eol=lf
 *.dtsi              text eol=lf
 
+# Documentation is rendered on Linux/CI and diffed across platforms; pin LF so
+# a checkout on Windows cannot silently rewrite every line.
+*.md                text eol=lf
+*.txt               text eol=lf
+
 # Binary-ish / generated artifacts: never touch
 *.dtb               binary
 *.bin               binary
