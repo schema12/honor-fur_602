@@ -22,6 +22,10 @@
 *.sh                text eol=lf
 diy-part2*.sh       text eol=lf
 
+# Python invoked directly by CI; LF so a CRLF checkout cannot corrupt the
+# shebang line or the file itself.
+*.py                text eol=lf
+
 # GitHub Actions workflows
 *.yml               text eol=lf
 *.yaml              text eol=lf
