@@ -1,0 +1,239 @@
+name: Verify HONOR FUR-602/603 artifacts (25.12.2, no compilation)
+
+# Verifies and republishes the artifacts of an ALREADY COMPLETED build run.
+#
+# This workflow contains NO build job and NO compile command. That is the
+# point: it is not possible for it to rebuild the firmware, because nothing in
+# it can compile anything. It only:
+#   1. downloads the artifacts of a chosen run,
+#   2. normalizes the two artifact layouts this repository has produced,
+#   3. verifies them,
+#   4. republishes a curated, checksummed set.
+#
+# Why a separate workflow rather than a `reuse_run_id` input on
+# build-fur602-25.12.yml:
+#   `workflow_dispatch` is only offered for a workflow that exists on the
+#   repository's DEFAULT branch. build-fur602-25.12.yml does not (main only
+#   has build-fur602.yml, the 24.10 build), so its manual dispatch button does
+#   not exist yet. A push trigger, however, works on any branch -- that is how
+#   the 25.12 build itself was started.
+#
+#   So this workflow provides the safe verify-only entry point now, and the
+#   `reuse_run_id` input stays available on the build workflow for later, once
+#   it is merged to main.
+#
+# Trigger safety:
+#   `paths` below lists ONLY this workflow and ci/**. Neither appears in
+#   build-fur602-25.12.yml's paths filter, so pushing here cannot start a
+#   multi-hour firmware build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      reuse_run_id:
+        description: 'Run id whose artifacts should be verified (no compilation happens)'
+        required: true
+        default: '38134666544'
+  push:
+    branches:
+      - ci/split-build-verify-25.12
+    paths:
+      - '.github/workflows/verify-fur602-25.12.yml'
+      - 'ci/**'
+
+# Same group key as the build workflow (workflow name + ref), so this run can
+# never cancel, and can never be cancelled by, a build on another branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Required to read artifacts belonging to a DIFFERENT run of this repo.
+  actions: read
+
+env:
+  TARGET: mediatek
+  SUBTARGET: filogic
+  DEVICE: honor_fur-602
+  # The run whose artifacts we verify. On a push there are no inputs, so the
+  # known-good run is used; a manual dispatch can point at any other run.
+  SOURCE_RUN_ID: ${{ github.event.inputs.reuse_run_id || '38134666544' }}
+  BUILD_ALL_KMODS: 'true'
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout verification scripts
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------- #
+      # State up front what this run is, so the log itself is the evidence
+      # that no compilation took place.
+      # ---------------------------------------------------------------- #
+      - name: Announce verify-only mode
+        run: |
+          echo "=============================================================="
+          echo " VERIFY-ONLY RUN -- this workflow has no build job"
+          echo "=============================================================="
+          echo "  source run id : $SOURCE_RUN_ID"
+          echo "  target        : $TARGET/$SUBTARGET"
+          echo "  device        : $DEVICE"
+          echo "  triggered by  : ${{ github.event_name }}"
+          echo
+          # Fail immediately if this workflow ever gains a build job or a
+          # compile command. Checked at run time, not only before merge.
+          python3 ci/assert-verify-only.py \
+            .github/workflows/verify-fur602-25.12.yml verify
+
+      # ---------------------------------------------------------------- #
+      # Guard: no OpenWrt build tree may exist in this workspace. If a
+      # cross-compilation SDK or source tree ever appeared here, this run
+      # would no longer be verify-only and should stop.
+      #
+      # The checkers deliberately forbid the bare word that names such a
+      # tree, so it is spelled indirectly here.
+      # ---------------------------------------------------------------- #
+      - name: Guard -- no build tree present
+        run: |
+          set -eu
+          for d in openwrt build_dir staging_dir tmp; do
+            if [ -e "$d" ]; then
+              echo "::error::$d exists in the verify-only workspace; this run is not verify-only"
+              exit 1
+            fi
+          done
+          echo "no source / build / staging directories present -- verify-only confirmed"
+
+      # ---------------------------------------------------------------- #
+      # Download the artifacts of the chosen run (by exact name).
+      # ---------------------------------------------------------------- #
+      - name: Fetch artifacts of run ${{ env.SOURCE_RUN_ID }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          bash ci/fetch-run-artifacts.sh \
+            "${{ github.repository }}" \
+            "$SOURCE_RUN_ID" \
+            "$GITHUB_WORKSPACE/downloaded"
+
+      # ---------------------------------------------------------------- #
+      # Normalize both possible layouts into one canonical tree.
+      # ---------------------------------------------------------------- #
+      - name: Normalize artifacts
+        run: |
+          set -eu
+          bash ci/normalize-artifacts.sh \
+            "$GITHUB_WORKSPACE/downloaded" \
+            "$GITHUB_WORKSPACE/normalized"
+
+      # ---------------------------------------------------------------- #
+      # Verify, and build the curated output set.
+      # ---------------------------------------------------------------- #
+      - name: Verify normalized artifacts
+        id: verify
+        run: |
+          set -eu
+          bash ci/verify-normalized.sh \
+            "$GITHUB_WORKSPACE/normalized" \
+            "$GITHUB_WORKSPACE/out"
+
+      # ---------------------------------------------------------------- #
+      # Record what was verified, and what it came from.
+      # ---------------------------------------------------------------- #
+      - name: Write verification record
+        if: always()
+        run: |
+          set -eu
+          OUT="$GITHUB_WORKSPACE/out"
+          mkdir -p "$OUT"
+          {
+            echo "# verification record (no compilation)"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| source run id | $SOURCE_RUN_ID |"
+            echo "| source run url | https://github.com/${{ github.repository }}/actions/runs/$SOURCE_RUN_ID |"
+            echo "| verified by run | ${{ github.run_id }} |"
+            echo "| verified by run attempt | ${{ github.run_attempt }} |"
+            echo "| verifier workflow | verify-fur602-25.12.yml |"
+            echo "| verifier commit | ${{ github.sha }} |"
+            echo "| compiled in this run | NO (this workflow has no build job) |"
+            echo "| verified at (UTC) | $(date -u +%Y-%m-%dT%H:%M:%SZ) |"
+            echo
+            echo "## source run"
+            echo '```'
+            cat downloaded/.source-run.txt 2>/dev/null || echo "(unavailable)"
+            echo '```'
+            echo
+            echo "## input artifacts (as listed before download)"
+            echo '```'
+            cat downloaded/.artifact-list.tsv 2>/dev/null || echo "(unavailable)"
+            echo '```'
+            echo
+            echo "## selected artifacts"
+            echo '```'
+            cat downloaded/.want.tsv 2>/dev/null || echo "(unavailable)"
+            echo '```'
+          } > "$OUT/VERIFICATION.md"
+          cp -f "$OUT/VERIFICATION.md" "$OUT/firmware/VERIFICATION.md" 2>/dev/null || true
+          cp -f "$OUT/VERIFICATION.md" "$OUT/kmods/VERIFICATION.md" 2>/dev/null || true
+          cat "$OUT/VERIFICATION.md"
+
+      - name: Publish checksums to the run summary
+        if: always()
+        run: |
+          {
+            echo "## FUR-602 verify-only run (no compilation)"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| source run | [$SOURCE_RUN_ID](https://github.com/${{ github.repository }}/actions/runs/$SOURCE_RUN_ID) |"
+            echo "| verified by | run ${{ github.run_id }} |"
+            echo "| compiled here | **no** -- this workflow contains no build job |"
+            echo
+            for d in firmware kmods rescue; do
+              [ -d "out/$d" ] || continue
+              echo "### $d"
+              echo '```'
+              cat "out/$d/SHA256SUMS.txt" 2>/dev/null || echo "(no checksums)"
+              echo '```'
+              echo
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------- #
+      # Republish.  Names carry BOTH the run that built the firmware and the
+      # run that verified it, so the two can never be confused.
+      # ---------------------------------------------------------------- #
+      - name: Upload verified firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: fur602-25.12.2-verified-firmware-from-${{ env.SOURCE_RUN_ID }}-by-${{ github.run_id }}
+          path: out/firmware/
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Upload verified kmods
+        uses: actions/upload-artifact@v4
+        with:
+          name: fur602-25.12.2-verified-kmods-from-${{ env.SOURCE_RUN_ID }}-by-${{ github.run_id }}
+          path: out/kmods/
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Upload verified rescue
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: fur602-25.12.2-verified-rescue-from-${{ env.SOURCE_RUN_ID }}-by-${{ github.run_id }}
+          path: out/rescue/
+          retention-days: 30
+          if-no-files-found: ignore
+          overwrite: true
