@@ -15,9 +15,16 @@
 
 * text=auto
 
+# This file itself, so it never gets rewritten on checkout either.
+.gitattributes      text eol=lf
+
 # Shell scripts -- must be LF, and must stay executable.
 *.sh                text eol=lf
 diy-part2*.sh       text eol=lf
+
+# Python invoked directly by CI; LF so a CRLF checkout cannot corrupt the
+# shebang line or the file itself.
+*.py                text eol=lf
 
 # GitHub Actions workflows
 *.yml               text eol=lf
@@ -33,6 +40,11 @@ diy-part2*.sh       text eol=lf
 # Device trees
 *.dts               text eol=lf
 *.dtsi              text eol=lf
+
+# Documentation is rendered on Linux/CI and diffed across platforms; pin LF so
+# a checkout on Windows cannot silently rewrite every line.
+*.md                text eol=lf
+*.txt               text eol=lf
 
 # Binary-ish / generated artifacts: never touch
 *.dtb               binary
