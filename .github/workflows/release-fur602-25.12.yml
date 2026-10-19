@@ -380,12 +380,31 @@ jobs:
           fi
 
           # Build the body with jq so the notes are escaped correctly.
+          #
+          # target_commitish is deliberately omitted and the tag is created
+          # beforehand instead. Creating a release with a target_commitish that
+          # needs a new tag was answered with 403 "Resource not accessible by
+          # integration" even though the same token could create a git ref
+          # (POST /git/refs -> 201). Creating the tag explicitly first avoids
+          # that path entirely.
+          tagsha=$(git rev-parse "${TARGET_COMMIT}^{commit}")
+          tagcode=$(curl -sS -o work/tag.json -w '%{http_code}' -X POST \
+                    -H "Authorization: Bearer ${GH_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "${API}/git/refs" \
+                    -d "{\"ref\":\"refs/tags/${RELEASE_TAG}\",\"sha\":\"${tagsha}\"}" || echo "000")
+          echo "POST /git/refs (tag) -> HTTP ${tagcode}"
+          if [ "$tagcode" != "201" ] && [ "$tagcode" != "422" ]; then
+            echo "::error::could not create tag ${RELEASE_TAG}: HTTP ${tagcode}: $(tr '\n' ' ' < work/tag.json | cut -c1-400)"
+            exit 1
+          fi
+          [ "$tagcode" = "422" ] && echo "  (tag already exists -- reusing it)"
+
           jq -n --arg tag "$RELEASE_TAG" \
-                --arg target "$TARGET_COMMIT" \
                 --arg name "HONOR FUR-602 — ImmortalWrt 25.12.2" \
                 --rawfile body work/release-notes.md \
-                '{tag_name:$tag, target_commitish:$target, name:$name,
-                  body:$body, prerelease:true, draft:false}' > work/release.json
+                '{tag_name:$tag, name:$name, body:$body,
+                  prerelease:true, draft:false}' > work/release.json
 
           code=$(curl -sS -o work/release-resp.json -w '%{http_code}' -X POST \
                  -H "Authorization: Bearer ${GH_TOKEN}" \
