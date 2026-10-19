@@ -343,14 +343,26 @@ jobs:
 
           echo
           echo "== what does the token itself claim about its permissions? =="
-          # The installation token endpoint is not reachable with GITHUB_TOKEN,
-          # so infer from the repo payload's permissions block when present.
           printf '%s' "$meta" | jq -r '.permissions // empty | to_entries[] | "  \(.key): \(.value)"' 2>/dev/null \
             || echo "  (repo payload carried no permissions block)"
+          echo "  repo payload keys: $(printf '%s' "$meta" | jq -r 'keys | join(",")' 2>/dev/null || echo '?')"
+
+          echo
+          echo "== repository workflow-permission policy (the decisive check) =="
+          # If this policy is "read", it caps the token no matter what the
+          # workflow declares, and every write returns 403.
+          pol=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer ${GH_TOKEN}" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/permissions/workflow" 2>&1 || true)
+          polbody=$(printf '%s' "$pol" | sed '$d')
+          polcode=$(printf '%s' "$pol" | tail -n1)
+          echo "  GET /actions/permissions/workflow -> HTTP ${polcode}"
+          echo "  body: ${polbody}"
+          pol_default=$(printf '%s' "$polbody" | jq -r '.default_workflow_permissions // "?"' 2>/dev/null || echo '?')
+          echo "  default_workflow_permissions = ${pol_default}"
 
           # Surface the decisive facts publicly, so a failure is diagnosable
           # without any credential.
-          echo "::warning::token probe: GET /releases -> HTTP ${readcode}; repo default_branch=$(printf '%s' "$meta" | jq -r '.default_branch // "?"' 2>/dev/null || echo '?')"
+          echo "::warning::token probe: GET /releases -> HTTP ${readcode}; GET /actions/permissions/workflow -> HTTP ${polcode}; default_workflow_permissions=${pol_default}; repo default_branch=$(printf '%s' "$meta" | jq -r '.default_branch // "?"' 2>/dev/null || echo '?')"
 
       - name: Create the Release
         if: ${{ env.PUBLISH == 'true' }}
