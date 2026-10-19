@@ -77,15 +77,25 @@ on:
         default: ''
   push:
     branches:
-      - main
-      # The migration branch is listed explicitly. `workflow_dispatch` only
-      # becomes available once a workflow exists on the repository's DEFAULT
-      # branch, so a push to this branch is how the first build is triggered
-      # without touching main.
+      # `main` is deliberately NOT listed.
+      #
+      # A full 25.12.2 build takes ~3.5 hours. When it was on `main`, simply
+      # landing documentation or CI plumbing that happens to touch one of the
+      # `paths` below would silently start one. Merging this workflow into
+      # `main` for the first time does exactly that, because every file in
+      # `paths` is new to `main` on that push.
+      #
+      # Builds on `main` are therefore an explicit act: Actions -> this
+      # workflow -> Run workflow (`workflow_dispatch`), which becomes available
+      # once this file exists on the default branch. Pass `reuse_run_id` to
+      # re-run only the verify half against an existing raw artifact.
+      #
+      # The migration branch keeps a push trigger so continued device work can
+      # still produce builds without touching `main`.
       - migration/immortalwrt-25.12.2
       # NOTE: the refactor branch (ci/split-build-verify-25.12) is deliberately
       # NOT listed, so pushing workflow changes there cannot kick off a
-      # multi-hour build. Trigger it manually once it is merged.
+      # multi-hour build.
     paths:
       - '.config.25.12'
       - 'diy-part2-25.12.sh'
