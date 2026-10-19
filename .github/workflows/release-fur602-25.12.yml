@@ -316,21 +316,32 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -eu
+          set -u
+          # Capture output instead of letting `set -e` swallow it: the job log
+          # needs a token to read, but ::error:: annotations are public, so the
+          # real reason must be surfaced that way.
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::release $RELEASE_TAG already exists; refusing to modify an existing archive"
             exit 1
           fi
 
-          gh release create "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$TARGET_COMMIT" \
-            --title "HONOR FUR-602 — ImmortalWrt 25.12.2" \
-            --notes-file work/release-notes.md \
-            --prerelease \
-            assets/*.zip SHA256SUMS.txt
-
+          echo "creating release $RELEASE_TAG at $TARGET_COMMIT"
+          if ! out=$(gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$TARGET_COMMIT" \
+              --title "HONOR FUR-602 — ImmortalWrt 25.12.2" \
+              --notes-file work/release-notes.md \
+              --prerelease \
+              assets/*.zip SHA256SUMS.txt 2>&1); then
+            echo "$out"
+            # Collapse to one line so the annotation stays readable.
+            msg=$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-800)
+            echo "::error::gh release create failed: $msg"
+            exit 1
+          fi
+          echo "$out"
           echo "release created"
+
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json tagName,url,isPrerelease,assets \
             | jq -r '"tag: \(.tagName)\nurl: \(.url)\nprerelease: \(.isPrerelease)", (.assets[] | "  \(.name)  \(.size)  \(.digest // "")")'
