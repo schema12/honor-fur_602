@@ -1,0 +1,370 @@
+name: Publish archived firmware to a GitHub Release (25.12.2, no compilation)
+
+# Publishes the already-verified firmware of a completed run as GitHub Release
+# assets, so the binaries survive independently of Actions artifact retention.
+#
+# This workflow contains NO build job and NO compile command. It only downloads
+# artifacts that already exist, verifies them, and attaches them to a Release.
+#
+# Why it exists as a workflow rather than a local script:
+#   Uploading release assets needs a token with `contents: write`. This
+#   repository's own GITHUB_TOKEN provides exactly that, scoped to this run.
+#   Nothing is read from the operator's machine, no personal access token is
+#   handled, and the credential never leaves GitHub's infrastructure.
+#
+# Trigger safety:
+#   `paths` lists ONLY this workflow file. Neither build workflow has it in its
+#   own paths filter, so pushing this file cannot start a firmware build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Build run whose firmware is being archived'
+        required: true
+        default: '38134666544'
+      verify_run_id:
+        description: 'Verify-only run that validated those artifacts'
+        required: true
+        default: '38208789499'
+      tag:
+        description: 'Release tag (must point at the device-adapt commit)'
+        required: true
+        default: 'fur602-immortalwrt-25.12.2-build-38134666544'
+      target_commit:
+        description: 'Commit the tag points at -- the device-adapt commit that built this firmware'
+        required: true
+        default: 'f2f6fbcac4c18c3ba7e7667e608e3e4583c13299'
+      publish:
+        description: 'Actually create the Release (uncheck for a dry run)'
+        type: boolean
+        required: true
+        default: true
+  push:
+    branches:
+      # Landing this file on the default branch is the deliberate archive act:
+      # that run downloads the already-verified artifacts and creates the
+      # Release. It compiles nothing.
+      - main
+      # Pushes here are dry runs only (see PUBLISH below), so iterating on this
+      # workflow cannot publish unreviewed.
+      - migration/immortalwrt-25.12.2
+    paths:
+      - '.github/workflows/release-fur602-25.12.yml'
+
+# Same per-ref isolation as the other workflows: never cancels, never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  # Needed to read artifacts of an earlier run.
+  actions: read
+  # Needed to create the tag, the Release and upload its assets.
+  contents: write
+
+env:
+  SOURCE_RUN_ID: ${{ github.event.inputs.source_run_id || '38134666544' }}
+  VERIFY_RUN_ID: ${{ github.event.inputs.verify_run_id || '38208789499' }}
+  RELEASE_TAG: ${{ github.event.inputs.tag || 'fur602-immortalwrt-25.12.2-build-38134666544' }}
+  TARGET_COMMIT: ${{ github.event.inputs.target_commit || 'f2f6fbcac4c18c3ba7e7667e608e3e4583c13299' }}
+  # Publishing happens when this file lands on the DEFAULT branch, or on an
+  # explicit manual run with publish=true. A push to the migration branch is
+  # always a dry run, so iterating on this workflow can never publish
+  # unreviewed. Landing it on `main` IS the deliberate archive act.
+  PUBLISH: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' && 'true') || github.event.inputs.publish || 'false' }}
+  IMMORTALWRT_SHA: '4fc16f2985a358bd43bb522e43f05395fcbd6ed5'
+  KERNEL_VERSION: '6.12.103'
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Announce
+        run: |
+          echo "=============================================================="
+          echo " ARCHIVE PUBLISHING -- this workflow has no build job"
+          echo "=============================================================="
+          echo "  source build run : $SOURCE_RUN_ID"
+          echo "  verify-only run  : $VERIFY_RUN_ID"
+          echo "  release tag      : $RELEASE_TAG"
+          echo "  tag target       : $TARGET_COMMIT"
+          echo "  publish          : $PUBLISH"
+          echo
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------- #
+      # The tag must point at the commit that actually built the firmware,
+      # not at a later CI-integration commit.
+      # ---------------------------------------------------------------- #
+      - name: Confirm the tag target is the device-adapt commit
+        run: |
+          set -eu
+          if ! git cat-file -e "${TARGET_COMMIT}^{commit}" 2>/dev/null; then
+            echo "::error::$TARGET_COMMIT is not a commit in this repository"
+            exit 1
+          fi
+          echo "resolved target: $(git rev-parse "${TARGET_COMMIT}^{commit}")"
+          subject=$(git log -1 --format=%s "$TARGET_COMMIT")
+          echo "target subject : $subject"
+          case "$subject" in
+            *"Merge the verified build/verify"*)
+              echo "::error::refusing to tag a CI-integration merge commit as the build source"
+              exit 1
+              ;;
+          esac
+          echo "tag target is a build commit, not an integration commit -- OK"
+
+      # ---------------------------------------------------------------- #
+      # Download the exact artifact zips over the REST API, so the bytes
+      # are identical to what GitHub recorded (a `gh run download` would
+      # extract them and re-zipping would change the digest).
+      # ---------------------------------------------------------------- #
+      - name: Download verified artifacts (byte-exact)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          mkdir -p assets work
+
+          curl -sS -f -H "Authorization: Bearer ${GH_TOKEN}" \
+               -H "Accept: application/vnd.github+json" \
+               "${API}/actions/runs/${VERIFY_RUN_ID}/artifacts?per_page=100" \
+               -o work/artifacts.json
+
+          echo "artifacts recorded for run ${VERIFY_RUN_ID}:"
+          jq -r '.artifacts[] | "  \(.id)  \(.size_in_bytes)  \(.digest // "(no digest)")  \(.name)"' work/artifacts.json
+
+          : > work/downloaded.tsv
+          for kind in firmware kmods rescue; do
+            name="fur602-25.12.2-verified-${kind}-from-${SOURCE_RUN_ID}-by-${VERIFY_RUN_ID}"
+            row=$(jq -r --arg n "$name" \
+                  '.artifacts[] | select(.name == $n) | "\(.id)\t\(.digest // "")"' \
+                  work/artifacts.json)
+            if [ -z "$row" ]; then
+              echo "::error::artifact not found on run ${VERIFY_RUN_ID}: $name"
+              exit 1
+            fi
+            id=$(printf '%s' "$row" | cut -f1)
+            digest=$(printf '%s' "$row" | cut -f2)
+
+            echo "downloading $name (id $id)"
+            curl -sS -f -L -H "Authorization: Bearer ${GH_TOKEN}" \
+                 "${API}/actions/artifacts/${id}/zip" \
+                 -o "assets/${name}.zip"
+
+            actual="sha256:$(sha256sum "assets/${name}.zip" | cut -d' ' -f1)"
+            size=$(stat -c %s "assets/${name}.zip")
+            echo "  size   : $size"
+            echo "  recorded: ${digest:-none}"
+            echo "  actual  : $actual"
+            if [ -n "$digest" ] && [ "$digest" != "$actual" ]; then
+              echo "::error::digest mismatch for $name: recorded $digest, got $actual"
+              exit 1
+            fi
+            printf '%s\t%s\t%s\t%s\n' "$kind" "$name" "$size" "$actual" >> work/downloaded.tsv
+          done
+
+          echo "all three artifacts downloaded and digest-matched"
+
+      # ---------------------------------------------------------------- #
+      # Re-verify the contents, not just the transport. Each artifact ships
+      # its own SHA256SUMS.txt.
+      # ---------------------------------------------------------------- #
+      - name: Re-verify artifact contents
+        run: |
+          set -eu
+          for zip in assets/*.zip; do
+            echo "== $zip"
+            d="work/$(basename "$zip" .zip)"
+            mkdir -p "$d"
+            unzip -q "$zip" -d "$d"
+            if [ -f "$d/SHA256SUMS.txt" ]; then
+              ( cd "$d" && sha256sum -c SHA256SUMS.txt --quiet ) \
+                && echo "   internal SHA256SUMS: all match" \
+                || { echo "::error::internal checksum failure in $zip"; exit 1; }
+            else
+              echo "::error::$zip has no SHA256SUMS.txt"
+              exit 1
+            fi
+            # A bootloader blob must never ride along in a flashable set.
+            if find "$d" -maxdepth 1 -type f \
+                 | grep -Ei '/(bl2|preloader|bl31|fip)[^/]*$'; then
+              echo "::error::$zip contains a bootloader image"
+              exit 1
+            fi
+          done
+          echo "contents re-verified"
+
+      # ---------------------------------------------------------------- #
+      # Release assets and their checksums, as actually uploaded.
+      # ---------------------------------------------------------------- #
+      - name: Compute release checksums
+        run: |
+          set -eu
+          ( cd assets && sha256sum *.zip | sort -k2 ) > SHA256SUMS.txt
+          echo "=== release assets ==="
+          while IFS="$(printf '\t')" read -r kind name size digest; do
+            printf '%-10s %-78s %12s  %s\n' "$kind" "$name.zip" "$size" "$digest"
+          done < work/downloaded.tsv
+          echo
+          cat SHA256SUMS.txt
+
+      - name: Write release notes
+        run: |
+          set -eu
+          {
+            echo "# HONOR FUR-602 / FUR-603 — ImmortalWrt 25.12.2"
+            echo
+            echo "> **测试构建 / pre-release。** 这不是经过完整验证的正式稳定固件。"
+            echo "> 硬件层面仍有未验证事项，见文末。"
+            echo
+            echo "## 适用机型"
+            echo
+            echo "荣耀 **HONOR FUR-602 / FUR-603**（联通定制版 XU50，MT7981B / Filogic 820）。"
+            echo
+            echo "## 构建来源"
+            echo
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 发行版 | ImmortalWrt **25.12.2** |"
+            echo "| ImmortalWrt 源码提交 | \`${IMMORTALWRT_SHA}\` |"
+            echo "| ImmortalWrt 引用 | \`refs/tags/v25.12.2\` |"
+            echo "| 设备适配源码提交 | \`${TARGET_COMMIT}\` |"
+            echo "| Linux 内核 | **${KERNEL_VERSION}** |"
+            echo "| 构建运行 | [${SOURCE_RUN_ID}](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}) |"
+            echo "| 产物验证运行 | [${VERIFY_RUN_ID}](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${VERIFY_RUN_ID}) |"
+            echo
+            echo "设备适配提交 \`${TARGET_COMMIT}\` 才是真正参与本次固件编译的源码提交；"
+            echo "本 Release 的标签即指向它，而不是之后的 CI 整合提交。"
+            echo
+            echo "## 无线驱动"
+            echo
+            echo "使用 **原生开源 mt76** 驱动（\`mac80211\` + \`mt76\`），不含任何闭源或树外驱动。"
+            echo
+            echo "## 产物说明"
+            echo
+            echo "| 文件 | 用途 |"
+            echo "| --- | --- |"
+            echo "| \`*-squashfs-factory.bin\` | **首次刷写**。裸 UBI 镜像，通过定制 U-Boot 的 Web 恢复页上传。 |"
+            echo "| \`*-squashfs-sysupgrade.bin\` | **后续升级**。tar 格式，在 ImmortalWrt 内用 LuCI / \`sysupgrade\` 刷入，可保留配置。 |"
+            echo "| \`*-initramfs-kernel.bin\` | **救援镜像**。仅内存运行，不写 flash，用于救砖或临时排查。 |"
+            echo "| kmods 包集（\`.apk\`） | 完整、ABI 匹配的内核模块集合，供事后安装。 |"
+            echo
+            echo "## 完整 kmod 包集的使用限制"
+            echo
+            echo "kmod 包集由 \`CONFIG_ALL_KMODS=y\` 生成，**只适用于内核 ${KERNEL_VERSION}**。"
+            echo "这些包以 \`.apk\` 格式发布（ImmortalWrt 25.12 默认 \`CONFIG_USE_APK=y\`），"
+            echo "索引为 \`packages.adb\`，**不是** opkg 的 \`.ipk\`/\`Packages\`。"
+            echo
+            echo "- 内核版本不匹配时**不可**安装，强行安装会导致模块加载失败。"
+            echo "- 这些包不在镜像内，需要按需安装（如 SQM/CAKE、IFB、nftables 扩展等）。"
+            echo "- 包与本次构建的 ABI 严格绑定，换用其他构建的固件后需重新取用对应包集。"
+            echo
+            echo "## 刷机前提（硬性）"
+            echo
+            echo "1. **必须使用匹配的定制 U-Boot**：[hanwckf/bl-mt798x](https://github.com/hanwckf/bl-mt798x) 的"
+            echo "   \`mt7981_honor_fur-602\`。原厂 HONOR U-Boot 有镜像签名锁定，无法刷入本固件。"
+            echo "2. **必须使用 \`expand(114m)\` 分区布局**。U-Boot 内置布局默认为 \`default\`（ubi 仅 64 MiB），"
+            echo "   而本固件 \`IMAGE_SIZE = 116736k\`（114 MiB）**只适配 \`expand(114m)\`**。"
+            echo "   不同布局之间互不兼容，未切换直接刷入会导致 UBI 溢出或无法启动。"
+            echo
+            echo '   ```'
+            echo '   setenv mtd_layout_label "expand(114m)"'
+            echo '   saveenv'
+            echo '   ```'
+            echo
+            echo "## 已验证与未验证"
+            echo
+            echo "**已验证：**"
+            echo
+            echo "- ImmortalWrt 25.12.2 完整固件编译成功（运行 ${SOURCE_RUN_ID}）。"
+            echo "- 全量 kmod 已生成并发布。"
+            echo "- 产物经独立校验运行（${VERIFY_RUN_ID}）逐文件复核：1130 个文件 SHA256 全部一致。"
+            echo
+            echo "**尚未经过完整实机验证：**"
+            echo
+            echo "- **5 GHz STA + AP 并发**（中继的同时开本地 AP）稳定性。"
+            echo "- **2.4 GHz monitor 模式**。"
+            echo "- **EEPROM / WiFi 校准数据**读取路径（DTS 中仍标注 \`TODO(verify-on-hardware)\`）。"
+            echo "- **NAND / NMBM** 长期读写稳定性与坏块处理。"
+            echo
+            echo "请在刷入前自行评估风险，并保留原厂固件与 U-Boot 的恢复手段。"
+            echo
+            echo "## 校验"
+            echo
+            echo "每个资产旁附 \`SHA256SUMS.txt\`；各资产内部另含构建时生成的 \`SHA256SUMS.txt\`。"
+            echo "下载后请核对："
+            echo
+            echo '```'
+            echo "sha256sum -c SHA256SUMS.txt"
+            echo '```'
+          } > work/release-notes.md
+          echo "notes written: $(wc -l < work/release-notes.md) lines"
+
+      - name: Create the Release
+        if: ${{ env.PUBLISH == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $RELEASE_TAG already exists; refusing to modify an existing archive"
+            exit 1
+          fi
+
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_COMMIT" \
+            --title "HONOR FUR-602 — ImmortalWrt 25.12.2" \
+            --notes-file work/release-notes.md \
+            --prerelease \
+            assets/*.zip SHA256SUMS.txt
+
+          echo "release created"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,url,isPrerelease,assets \
+            | jq -r '"tag: \(.tagName)\nurl: \(.url)\nprerelease: \(.isPrerelease)", (.assets[] | "  \(.name)  \(.size)  \(.digest // "")")'
+
+      - name: Confirm the tag points at the device-adapt commit
+        if: ${{ env.PUBLISH == 'true' }}
+        run: |
+          set -eu
+          tag_sha=$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}" 2>/dev/null || true)
+          if [ -z "$tag_sha" ]; then
+            git fetch --tags --force origin >/dev/null 2>&1 || true
+            tag_sha=$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}" 2>/dev/null || true)
+          fi
+          echo "tag ${RELEASE_TAG} -> ${tag_sha}"
+          echo "expected           -> $(git rev-parse "${TARGET_COMMIT}^{commit}")"
+          if [ "$tag_sha" != "$(git rev-parse "${TARGET_COMMIT}^{commit}")" ]; then
+            echo "::error::tag does not point at the device-adapt commit"
+            exit 1
+          fi
+          echo "tag target correct"
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## Firmware archive (no compilation)"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| source build run | ${SOURCE_RUN_ID} |"
+            echo "| verify-only run | ${VERIFY_RUN_ID} |"
+            echo "| tag | \`${RELEASE_TAG}\` |"
+            echo "| tag target | \`${TARGET_COMMIT}\` |"
+            echo "| compiled here | **no** — this workflow has no build job |"
+            echo
+            if [ -f SHA256SUMS.txt ]; then
+              echo '```'
+              cat SHA256SUMS.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
