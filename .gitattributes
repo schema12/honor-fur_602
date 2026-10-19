@@ -1,0 +1,57 @@
+# Line-ending policy for this repository.
+#
+# The build scripts and workflow files are consumed by Linux (GitHub Actions
+# ubuntu-22.04, and the OpenWrt build itself). If any of them is checked out
+# with CRLF, they break in ways that are hard to read:
+#   * `diy-part2-25.12.sh`  -> "bash: ./diy-part2-25.12.sh: /bin/bash^M: bad interpreter"
+#   * embedded heredocs      -> the terminator never matches ("EOF\r" != "EOF")
+#   * .config / .append      -> stray CRs become part of values
+#
+# So pin LF explicitly for everything the build touches, regardless of the
+# committer's platform or core.autocrlf setting.
+#
+# NOTE: *.dts/*.dtsi are deliberately NOT listed with text=auto, because the
+# kernel device trees are plain LF and must stay byte-identical.
+
+* text=auto
+
+# This file itself, so it never gets rewritten on checkout either.
+.gitattributes      text eol=lf
+
+# Shell scripts -- must be LF, and must stay executable.
+*.sh                text eol=lf
+diy-part2*.sh       text eol=lf
+
+# Python invoked directly by CI; LF so a CRLF checkout cannot corrupt the
+# shebang line or the file itself.
+*.py                text eol=lf
+
+# GitHub Actions workflows
+*.yml               text eol=lf
+*.yaml              text eol=lf
+
+# Build inputs consumed on Linux
+*.config            text eol=lf
+.config*            text eol=lf
+*.append            text eol=lf
+*.lock              text eol=lf
+*.diff              text eol=lf
+
+# Device trees
+*.dts               text eol=lf
+*.dtsi              text eol=lf
+
+# Documentation is rendered on Linux/CI and diffed across platforms; pin LF so
+# a checkout on Windows cannot silently rewrite every line.
+*.md                text eol=lf
+*.txt               text eol=lf
+
+# Binary-ish / generated artifacts: never touch
+*.dtb               binary
+*.bin               binary
+*.ipk               binary
+*.tar               binary
+*.zst               binary
+*.xz                binary
+*.png               binary
+*.jpg               binary

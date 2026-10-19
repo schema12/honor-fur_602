@@ -1,0 +1,79 @@
+# ============================================================================
+#  ImmortalWrt 25.12.2  --  main source lock
+# ============================================================================
+#  Shell-sourceable.  The workflow sources this file and refuses to build
+#  unless the actually checked-out commit matches REPO_SHA exactly.
+#
+#  DO NOT hand-edit REPO_SHA.  It was taken from upstream, not guessed.
+# ----------------------------------------------------------------------------
+
+DIST_NAME="ImmortalWrt"
+DIST_VERSION="25.12.2"
+
+REPO_URL="https://github.com/immortalwrt/immortalwrt"
+REPO_REF="refs/tags/v25.12.2"
+REPO_TAG="v25.12.2"
+
+# The annotated tag object itself (what `git rev-parse refs/tags/v25.12.2` prints).
+REPO_TAG_OBJECT="bfc8bae082b913eb60e3247bb3e3a9cb3a6fde55"
+# The commit the tag points at -- this is the real build baseline.
+REPO_SHA="4fc16f2985a358bd43bb522e43f05395fcbd6ed5"
+
+# Kernel / target facts read out of the locked tree.
+KERNEL_PATCHVER="6.12"
+KERNEL_VERSION="6.12.103"
+KERNEL_SOURCE_HASH="f143aaade8877ba5616e788b4482576db28481bcf557ef537f4fcc3938fc3176"
+TARGET="mediatek"
+SUBTARGET="filogic"
+
+# Version strings baked into the release by the tagged commit itself.
+VERSION_CODE="r38135-0c4cd0f9920a"
+VERSION_REPO="https://downloads.immortalwrt.org/releases/25.12.2"
+
+# ----------------------------------------------------------------------------
+#  How REPO_SHA maps to the official 25.12.2 release baseline
+# ----------------------------------------------------------------------------
+#  Evidence chain (all read from upstream at this exact SHA):
+#
+#  1. The GitHub *Releases* page for immortalwrt/immortalwrt is EMPTY
+#     (GET /releases -> []).  ImmortalWrt does not publish GitHub Releases,
+#     so the absence of a Release entry proves nothing.  The authoritative
+#     marker is the git tag.
+#
+#  2. `v25.12.2` exists as an ANNOTATED, PGP-SIGNED tag:
+#         tag object : bfc8bae082b913eb60e3247bb3e3a9cb3a6fde55
+#         type       : tag (not commit)
+#         tag        : v25.12.2
+#         tagger     : Tianling Shen <cnsztl@immortalwrt.org>
+#         tag date   : 2026-09-06T14:02:15Z
+#         message    : "ImmortalWrt v25.12.2 Release"
+#         signature  : verified, valid
+#         object     : commit 4fc16f2985a358bd43bb522e43f05395fcbd6ed5
+#
+#  3. That commit's own message is "ImmortalWrt v25.12.2: adjust config
+#     defaults", and it performs exactly the release-engineering edits:
+#         include/version.mk  25.12-SNAPSHOT -> 25.12.2
+#                             code -> r38135-0c4cd0f9920a
+#                             repo -> .../releases/25.12.2
+#         feeds.conf.default  branch refs -> exact commit pins (see feeds lock)
+#         package/base-files/image-config.in  release repo default
+#         version, version.date               (new files)
+#
+#  4. Therefore building from commit 4fc16f298... reproduces the 25.12.2
+#     release baseline and yields firmware reporting 25.12.2 /
+#     r38135-0c4cd0f9920a.
+#
+#  IMPORTANT -- the branch head is NOT 25.12.2:
+#     refs/heads/openwrt-25.12 = ce35a9e4ef1b87fbbc2146036ce6693e4242861a
+#     (dated 2026-10-09, "Merge Official Source")
+#  That is *ahead* of the release tag.  Building the branch head would give a
+#  moving 25.12-SNAPSHOT, not 25.12.2.  This lock exists precisely to prevent
+#  that drift.
+#
+#  NOT VERIFIED: downloads.immortalwrt.org was unreachable from the machine
+#  that produced this lock, so version.buildinfo / feeds.buildinfo /
+#  config.buildinfo from the official download directory could not be read.
+#  The source-tree evidence above is strictly stronger for pinning *source*
+#  and *feeds* (the feeds SHAs are committed inside the release commit), but
+#  it does not independently confirm the official binary artifacts.
+# ----------------------------------------------------------------------------

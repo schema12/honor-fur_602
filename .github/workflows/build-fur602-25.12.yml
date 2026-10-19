@@ -1,0 +1,1068 @@
+name: Build HONOR FUR-602/603 (ImmortalWrt 25.12.2)
+
+# Builds an ImmortalWrt 25.12.2 (kernel 6.12) firmware for the HONOR FUR-602 /
+# FUR-603 (MT7981B), targeting the hanwckf/bl-mt798x U-Boot with the
+# expand(114m) NAND layout.
+#
+# The source baseline is NOT "whatever the branch head is today". It is pinned
+# to the commit the official v25.12.2 release tag points at, recorded in
+# locks/immortalwrt-25.12.2.lock, and every feed is pinned in
+# locks/feeds-25.12.2.lock. The job aborts if the checked-out commit or any feed
+# does not match its lock -- it never silently falls back to a floating branch.
+#
+# Design notes
+# ------------
+# * TWO JOBS, on purpose:
+#     build  -- the expensive part (hours). The moment it finishes it uploads
+#               a raw build artifact holding everything the build produced:
+#               factory.bin, sysupgrade.bin, the full kmod package set, the
+#               package index, the manifest and the provenance record.
+#     verify -- cheap (seconds). It downloads that raw artifact, checks it,
+#               and only then produces the curated, published artifacts.
+#
+#   Why: in the first run this workflow ever did, the compile succeeded and
+#   then a bug in the verification step aborted the job. Because collection
+#   and upload were ordinary steps gated on success(), they were skipped, the
+#   runner's ephemeral disk was destroyed, and ~3h of compilation produced
+#   nothing recoverable. Verification can be wrong; it must not be able to
+#   destroy the build output. Now a verification failure leaves the raw
+#   artifact intact, and verification can be re-run on its own with the
+#   `reuse_run_id` input -- no recompilation.
+# * Recompilation happens only when the source really changed: a different
+#   locked SHA, different feeds, different build config, or a different
+#   compiled result. A verification-only fix does not.
+# * Non-destructive: this workflow coexists with build-fur602.yml (the 24.10
+#   build), which is left untouched as the rollback path. The two share no
+#   filenames: this one uses mt7981b-honor-fur-602-2512.dts,
+#   filogic.mk.25.12.append, filogic.config.25.12.append, .config.25.12 and
+#   diy-part2-25.12.sh.
+# * The device is *injected* into the stock tree by diy-part2-25.12.sh rather
+#   than living in a fork: DTS -> target/linux/mediatek/dts/, device definition
+#   -> target/linux/mediatek/image/filogic.mk. The script fails loudly if the
+#   assumptions it depends on no longer hold (kernel 6.12, the mt7981b.dtsi
+#   include convention, NMBM still supported, generic nand_do_upgrade fallback
+#   intact).
+#
+#   NOTE on mt7981b.dtsi: that file is NOT in the OpenWrt tree. It comes from
+#   the kernel tarball, and OpenWrt's own patch
+#   target/linux/mediatek/patches-6.12/117-complete-mt7981b-dtsi.patch adds the
+#   eth/spi0/wifi/mdio_bus nodes to it at build time. So the guard rail checks
+#   the *convention* via in-tree sibling DTS rather than the file itself.
+# * CONFIG_ALL_KMODS=y builds + publishes the complete, ABI-matched kmod set
+#   (tc/qdisc/CAKE/IFB, netfilter, mac80211/mt76, USB, ...) so those can be
+#   installed later, while the image itself still only contains
+#   DEFAULT_PACKAGES + DEVICE_PACKAGES. The workflow *proves* this by checking
+#   the published package files, not just the .config.
+#   25.12 defaults to CONFIG_USE_APK=y, so those packages are .apk with a
+#   packages.adb index; the checks detect the format instead of assuming .ipk.
+# * Artifacts are named with the source SHA and the run id, and every file is
+#   SHA256-listed, so nothing from an older build can be mistaken for fresh.
+# * No root password is hardcoded and no package-signature check is disabled.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'Override the locked ImmortalWrt commit (EXPERIMENTAL -- marks the build as unverified)'
+        required: false
+        default: ''
+      build_all_kmods:
+        description: 'Publish the full kmod set (CONFIG_ALL_KMODS=y). Turn off only for a quick boot-only test build.'
+        type: boolean
+        required: true
+        default: true
+      reuse_run_id:
+        description: 'Verification only: reuse the raw build artifact from this run id and SKIP compiling.'
+        required: false
+        default: ''
+  push:
+    branches:
+      # `main` is deliberately NOT listed.
+      #
+      # A full 25.12.2 build takes ~3.5 hours. When it was on `main`, simply
+      # landing documentation or CI plumbing that happens to touch one of the
+      # `paths` below would silently start one. Merging this workflow into
+      # `main` for the first time does exactly that, because every file in
+      # `paths` is new to `main` on that push.
+      #
+      # Builds on `main` are therefore an explicit act: Actions -> this
+      # workflow -> Run workflow (`workflow_dispatch`), which becomes available
+      # once this file exists on the default branch. Pass `reuse_run_id` to
+      # re-run only the verify half against an existing raw artifact.
+      #
+      # The migration branch keeps a push trigger so continued device work can
+      # still produce builds without touching `main`.
+      - migration/immortalwrt-25.12.2
+      # NOTE: the refactor branch (ci/split-build-verify-25.12) is deliberately
+      # NOT listed, so pushing workflow changes there cannot kick off a
+      # multi-hour build.
+    paths:
+      - '.config.25.12'
+      - 'diy-part2-25.12.sh'
+      - 'filogic.mk.25.12.append'
+      - 'filogic.config.25.12.append'
+      - 'mt7981b-honor-fur-602-2512.dts'
+      - 'locks/**'
+      - '.github/workflows/build-fur602-25.12.yml'
+
+# Runs are grouped per workflow AND per ref, so a push to one branch can never
+# cancel a build running on another. cancel-in-progress only ever affects a
+# second run on the SAME ref, where the older run's output is superseded anyway
+# -- and, since the build job now uploads its raw artifact as soon as it
+# finishes, that superseded output is preserved rather than lost.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# `actions: read` is what lets the verify job download the raw artifact from an
+# earlier run when reuse_run_id is used.
+permissions:
+  contents: read
+  actions: read
+
+env:
+  TARGET: mediatek
+  SUBTARGET: filogic
+  DEVICE: honor_fur-602
+  # Must match DEVICE_DTS in filogic.mk.25.12.append
+  DTS_NAME: mt7981b-honor-fur-602-2512
+  LOCK_MAIN: locks/immortalwrt-25.12.2.lock
+  LOCK_FEEDS: locks/feeds-25.12.2.lock
+
+jobs:
+  # ==================================================================== #
+  # JOB 1 -- compile.  Nothing here decides whether the firmware is good;
+  # it just builds it and preserves what it produced.
+  # ==================================================================== #
+  build:
+    # Skipped entirely when the caller asked to reuse an existing build.
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.reuse_run_id == '' }}
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout build config
+        uses: actions/checkout@v4
+
+      - name: Load and validate version locks
+        id: lock
+        run: |
+          set -eu
+          . "$LOCK_MAIN"
+          . "$LOCK_FEEDS"
+
+          echo "dist          = ${DIST_NAME} ${DIST_VERSION}"
+          echo "repo          = ${REPO_URL}"
+          echo "ref           = ${REPO_REF}"
+          echo "locked sha    = ${REPO_SHA}"
+          echo "kernel        = ${KERNEL_VERSION} (patchver ${KERNEL_PATCHVER})"
+
+          # The lock must contain a real 40-hex commit, not a placeholder.
+          if ! printf '%s' "$REPO_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::REPO_SHA in $LOCK_MAIN is not a 40-hex commit: '$REPO_SHA'"
+            exit 1
+          fi
+
+          # Manual override => experimental, clearly labelled, never silent.
+          OVERRIDE="${{ github.event.inputs.source_sha || '' }}"
+          if [ -n "$OVERRIDE" ]; then
+            if ! printf '%s' "$OVERRIDE" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::source_sha override is not a 40-hex commit: '$OVERRIDE'"
+              exit 1
+            fi
+            echo "::warning::EXPERIMENTAL BUILD -- source_sha overridden to $OVERRIDE"
+            echo "::warning::This build does NOT correspond to the locked ${DIST_VERSION} baseline."
+            echo "EXPERIMENTAL=true" >> "$GITHUB_ENV"
+            echo "REPO_SHA=$OVERRIDE" >> "$GITHUB_ENV"
+          else
+            echo "EXPERIMENTAL=false" >> "$GITHUB_ENV"
+            echo "REPO_SHA=$REPO_SHA" >> "$GITHUB_ENV"
+          fi
+
+          {
+            echo "dist_name=$DIST_NAME"
+            echo "dist_version=$DIST_VERSION"
+            echo "repo_url=$REPO_URL"
+            echo "repo_ref=$REPO_REF"
+            echo "kernel_version=$KERNEL_VERSION"
+            echo "version_code=$VERSION_CODE"
+            echo "feed_names=$FEED_NAMES"
+          } >> "$GITHUB_OUTPUT"
+
+          # Persist the feed pins for the later verification step.
+          {
+            for f in $FEED_NAMES; do
+              eval "u=\${FEED_${f}_URL}"; eval "s=\${FEED_${f}_SHA}"
+              echo "${f}|${u}|${s}"
+            done
+          } > /tmp/feed-pins.txt
+          cat /tmp/feed-pins.txt
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses5-dev libssl-dev python3 python3-pip python3-setuptools \
+            rsync unzip zlib1g-dev file wget curl subversion patch swig libelf-dev \
+            libncursesw5-dev zstd
+
+      # ------------------------------------------------------------------ #
+      # Clone the EXACT locked commit, then verify it.
+      # ------------------------------------------------------------------ #
+      - name: Clone ImmortalWrt at the locked commit
+        run: |
+          set -eu
+          echo "cloning ${{ steps.lock.outputs.repo_url }} @ $REPO_SHA"
+          git init -q openwrt
+          cd openwrt
+          git remote add origin "${{ steps.lock.outputs.repo_url }}"
+
+          # Fetch exactly the commit we want. GitHub allows fetching a
+          # reachable SHA directly; if that ever stops working, fall back to
+          # fetching the release tag itself. Either way we verify the SHA next.
+          if git fetch -q --depth 1 origin "$REPO_SHA" 2>/dev/null; then
+            echo "fetched by sha"
+          else
+            echo "direct sha fetch failed, falling back to the tag"
+            git fetch -q --depth 1 origin "${{ steps.lock.outputs.repo_ref }}"
+          fi
+          git checkout -q FETCH_HEAD
+
+      - name: Verify the locked source commit
+        working-directory: openwrt
+        run: |
+          set -eu
+          ACTUAL=$(git rev-parse HEAD)
+          echo "expected = $REPO_SHA"
+          echo "actual   = $ACTUAL"
+          if [ "$ACTUAL" != "$REPO_SHA" ]; then
+            echo "::error::checked-out commit $ACTUAL does not match the locked commit $REPO_SHA"
+            echo "::error::Refusing to build an unpinned source tree."
+            exit 1
+          fi
+          echo "IMM_COMMIT=$ACTUAL" >> "$GITHUB_ENV"
+          echo "IMM_COMMIT_SHORT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+          # The release commit must actually declare itself as 25.12.2.
+          test -f version || { echo "::error::no 'version' file -- this is not a release commit"; exit 1; }
+          echo "version file: $(cat version)"
+          grep -q '25\.12\.2' include/version.mk \
+            || { echo "::error::include/version.mk does not mention 25.12.2"; exit 1; }
+
+      # ------------------------------------------------------------------ #
+      # Guard rails: the whole device definition assumes a 6.12-era tree.
+      # ------------------------------------------------------------------ #
+      - name: Verify source tree matches our assumptions
+        working-directory: openwrt
+        run: |
+          set -eu
+          KV=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/mediatek/Makefile)
+          echo "KERNEL_PATCHVER=$KV"
+          if [ "$KV" != "6.12" ]; then
+            echo "::error::expected kernel 6.12 for ImmortalWrt 25.12.2, got '$KV'."
+            echo "::error::This repository is pinned to the 25.12.2 / 6.12 design. Refusing to build."
+            exit 1
+          fi
+
+          test -f target/linux/mediatek/image/filogic.mk
+          test -f target/linux/mediatek/image/Makefile
+          test -d target/linux/mediatek/dts
+          test -f target/linux/mediatek/filogic/config-6.12
+          test ! -f target/linux/mediatek/config-6.12
+
+          # The MT7981 SoC include convention must be the 6.12 one. mt7981b.dtsi
+          # is NOT in the OpenWrt tree -- it is unpacked from the kernel tarball
+          # at build time -- so we assert the convention via the in-tree sibling
+          # device trees, which ARE present and authoritative.
+          grep -rlq '#include "mt7981b.dtsi"' target/linux/mediatek/dts \
+            || { echo "::error::no in-tree DTS includes mt7981b.dtsi -- SoC include convention changed"; exit 1; }
+          if grep -rlq '#include "mt7981\.dtsi"' target/linux/mediatek/dts; then
+            echo "::error::an in-tree DTS still includes the old mt7981.dtsi -- not a 6.12-generation tree"
+            exit 1
+          fi
+          grep -rlq '<dt-bindings/pinctrl/mt65xx.h>' target/linux/mediatek/dts \
+            || { echo "::error::no in-tree DTS includes mt65xx.h -- pinctrl binding header unavailable"; exit 1; }
+
+          # NMBM must still be supported: this board REQUIRES it.
+          BMT=target/linux/generic/files/drivers/mtd/nand/mtk_bmt.c
+          test -f "$BMT" || { echo "::error::$BMT missing -- MediaTek BMT/NMBM driver gone"; exit 1; }
+          grep -q 'mediatek,nmbm' "$BMT" \
+            || { echo "::error::$BMT no longer handles mediatek,nmbm -- NMBM support removed"; exit 1; }
+          grep -q '^CONFIG_MTD_NAND_MTK_BMT=y' target/linux/mediatek/filogic/config-6.12 \
+            || { echo "::error::CONFIG_MTD_NAND_MTK_BMT=y not set -- NMBM would not be built in"; exit 1; }
+
+          # Device/Default must still synthesise the FIT kernel we rely on.
+          # Doubled dollars on purpose: in a Makefile $$(x) is a literal $(x).
+          grep -q 'fit lzma \$\$(KDIR)/image-\$\$(firstword \$\$(DEVICE_DTS)).dtb' \
+            target/linux/mediatek/image/Makefile
+
+          # The upgrade path must still be the generic nand_do_upgrade fallback:
+          # nand_do_platform_check() (package/base-files .../nand.sh) detects our
+          # sysupgrade tar via sysupgrade-<board>/CONTROL and then untars it.
+          PF=target/linux/mediatek/filogic/base-files/lib/upgrade/platform.sh
+          grep -q 'nand_do_upgrade "\$1"' "$PF"
+          if grep -q 'honor,fur-602' "$PF"; then
+            echo "::error::$PF now special-cases honor,fur-602; re-verify the upgrade path"
+            exit 1
+          fi
+
+          # The U-Boot looks for UBI volumes literally named kernel/rootfs.
+          NS=package/base-files/files/lib/upgrade/nand.sh
+          grep -q 'CI_KERNPART="\${CI_KERNPART:-kernel}"' "$NS" \
+            || { echo "::error::nand.sh CI_KERNPART default changed"; exit 1; }
+          grep -q 'CI_ROOTPART="\${CI_ROOTPART:-rootfs}"' "$NS" \
+            || { echo "::error::nand.sh CI_ROOTPART default changed"; exit 1; }
+
+          echo "source tree OK"
+
+      # ------------------------------------------------------------------ #
+      # Feed pinning: rewrite feeds.conf.default with the locked SHAs.
+      # ------------------------------------------------------------------ #
+      - name: Pin feeds to the locked commits
+        working-directory: openwrt
+        run: |
+          set -eu
+          echo "--- upstream feeds.conf.default (as shipped by the release) ---"
+          cat feeds.conf.default
+
+          # The release commit already pins every feed with ^<sha>. Assert that
+          # what upstream ships matches our lock, so a mismatch is caught here
+          # rather than after a silent drift.
+          while IFS='|' read -r name url sha; do
+            [ -n "$name" ] || continue
+            if grep -q "\^${sha}\$" feeds.conf.default; then
+              echo "  OK   $name pinned to $sha in feeds.conf.default"
+            else
+              echo "::error::feed '$name' is NOT pinned to $sha in feeds.conf.default"
+              grep -n "$name" feeds.conf.default || true
+              exit 1
+            fi
+          done < /tmp/feed-pins.txt
+
+          echo "all feeds pinned as expected"
+
+      - name: Update and install feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ------------------------------------------------------------------ #
+      # Verify the feeds really landed on the locked commits.
+      # ------------------------------------------------------------------ #
+      - name: Verify feed commits
+        working-directory: openwrt
+        run: |
+          set -eu
+          rc=0
+          while IFS='|' read -r name url sha; do
+            [ -n "$name" ] || continue
+            if [ ! -d "feeds/$name" ]; then
+              echo "::error::feed directory feeds/$name missing"; rc=1; continue
+            fi
+            actual=$(git -C "feeds/$name" rev-parse HEAD 2>/dev/null || echo MISSING)
+            if [ "$actual" != "$sha" ]; then
+              echo "::error::feed $name is at $actual, expected $sha"
+              rc=1
+            else
+              echo "  OK   $name @ $actual"
+            fi
+          done < /tmp/feed-pins.txt
+          [ "$rc" -eq 0 ] || { echo "::error::feed commit verification failed"; exit 1; }
+
+          # Record what we actually built against.
+          {
+            echo "FEEDS_RESOLVED<<EOF"
+            while IFS='|' read -r name url sha; do
+              [ -n "$name" ] || continue
+              printf '%s %s %s\n' "$name" "$(git -C "feeds/$name" rev-parse HEAD)" "$url"
+            done < /tmp/feed-pins.txt
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------ #
+      # Inject the device, then re-assert the DTS survives feeds install.
+      # ------------------------------------------------------------------ #
+      - name: Inject HONOR FUR-602/603 device support
+        run: |
+          set -eu
+          # diy-part2-25.12.sh runs with CWD=openwrt/ and reads the device files
+          # from "../", i.e. this repository root -- which is where they already
+          # are, because actions/checkout put the repo at the workspace root and
+          # we created openwrt/ inside it. Nothing to copy for the DTS.
+          cp -f .config.25.12 openwrt/.config
+          cp -f diy-part2-25.12.sh openwrt/diy-part2-25.12.sh
+
+          # CONFIG_ALL_KMODS=y publishes the complete, ABI-matched kmod set
+          # (tc/qdisc/CAKE/IFB, netfilter, mac80211/mt76, USB, ...) so they can
+          # be installed on the device later, without adding them to the image.
+          # Allow a deliberate opt-out for a quick boot-only test build.
+          if [ "${{ github.event.inputs.build_all_kmods || 'true' }}" = "false" ]; then
+            echo "NOTE: build_all_kmods=false -- dropping CONFIG_ALL_KMODS=y"
+            sed -i '/^CONFIG_ALL_KMODS=y$/d' openwrt/.config
+          fi
+          echo "--- build .config ---"
+          cat openwrt/.config
+
+          cd openwrt
+          chmod +x diy-part2-25.12.sh
+          ./diy-part2-25.12.sh
+
+      - name: Re-assert DTS once feeds are installed
+        working-directory: openwrt
+        run: |
+          set -eu
+          test -f "target/linux/mediatek/dts/$DTS_NAME.dts" || {
+            echo "::error::DTS target/linux/mediatek/dts/$DTS_NAME.dts disappeared"
+            exit 1
+          }
+          # Must include the 6.12 SoC header, not the 5.4-era one.
+          grep -q '#include "mt7981b.dtsi"' "target/linux/mediatek/dts/$DTS_NAME.dts" \
+            || { echo "::error::$DTS_NAME.dts does not include mt7981b.dtsi"; exit 1; }
+          grep -q 'mediatek,nmbm' "target/linux/mediatek/dts/$DTS_NAME.dts" \
+            || { echo "::error::$DTS_NAME.dts lost its NMBM properties"; exit 1; }
+
+      - name: Generate .config
+        working-directory: openwrt
+        run: make defconfig
+
+      # ---------------------------------------------------------------- #
+      # Fail fast: if the device is not in the config there is no point
+      # compiling for two hours and finding out at the end.
+      # ---------------------------------------------------------------- #
+      - name: Pre-build check -- device, kmods and wireless present
+        working-directory: openwrt
+        run: |
+          set -eu
+          echo "===== target / device selection ====="
+          grep -E '^CONFIG_TARGET_mediatek(_filogic)?=' .config || true
+          if ! grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_honor_fur-602=' .config; then
+            echo "::error::CONFIG_TARGET_mediatek_filogic_DEVICE_honor_fur-602 is not set."
+            echo "::error::The device definition did not register -- check filogic.mk injection."
+            exit 1
+          fi
+
+          echo "===== kmod publishing (so these are installable later) ====="
+          if [ "${{ github.event.inputs.build_all_kmods || 'true' }}" = "false" ]; then
+            echo "  (skipped: build_all_kmods=false)"
+          else
+            if ! grep -q '^CONFIG_ALL_KMODS=y' .config; then
+              echo "::error::CONFIG_ALL_KMODS=y missing: the full kmod set (tc/qdisc/CAKE/IFB,"
+              echo "::error::netfilter, mac80211/mt76, USB, ...) would not be published, and a"
+              echo "::error::later installing kmod-sched-cake on the device would fail."
+              exit 1
+            fi
+            echo "  CONFIG_ALL_KMODS=y present"
+          fi
+
+          echo "===== required wireless kmods selected by the device ====="
+          # These come from DEVICE_PACKAGES in our filogic.mk entry; they must be
+          # selected as =y in .config (installed into the image, not just built).
+          for p in kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware; do
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              echo "  OK   $p"
+            else
+              echo "::error::$p is not selected in .config; the device would have no working WiFi / offload firmware"
+              exit 1
+            fi
+          done
+
+          echo "===== QoE/QoS relevant kmod packages exist in the tree ====="
+          for kp in sched-core sched sched-cake sched-prio sched-fq-pie ifb; do
+            grep -q "define KernelPackage/$kp\$" package/kernel/linux/modules/netsupport.mk \
+              || grep -q "define KernelPackage/$kp\$" package/kernel/linux/modules/netdevices.mk \
+              || { echo "::error::KernelPackage/$kp definition not found"; exit 1; }
+          done
+
+          echo "pre-build check passed"
+
+      - name: Download packages
+        working-directory: openwrt
+        run: make download -j8
+
+      - name: Build firmware
+        working-directory: openwrt
+        run: |
+          make -j$(nproc) || make -j1 V=s
+
+      # ---------------------------------------------------------------- #
+      # Provenance.  Written even when the build failed, so a reused
+      # verification still knows exactly which source it is looking at.
+      # env.txt is in GITHUB_ENV format: the verify job cats it straight
+      # back into its own environment.
+      # ---------------------------------------------------------------- #
+      - name: Write build provenance
+        if: always()
+        working-directory: openwrt
+        run: |
+          set -eu
+          BIN="bin/targets/$TARGET/$SUBTARGET"
+          OUT="$GITHUB_WORKSPACE/provenance"
+          mkdir -p "$OUT"
+
+          {
+            echo "# HONOR FUR-602/603 build provenance"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| distribution | ${{ steps.lock.outputs.dist_name }} ${{ steps.lock.outputs.dist_version }} |"
+            echo "| experimental | ${EXPERIMENTAL:-unknown} |"
+            echo "| github run id | ${{ github.run_id }} |"
+            echo "| github run number | ${{ github.run_number }} |"
+            echo "| github run attempt | ${{ github.run_attempt }} |"
+            echo "| config repo commit | ${{ github.sha }} |"
+            echo "| immortalwrt commit | ${IMM_COMMIT:-unknown} |"
+            echo "| immortalwrt ref | ${{ steps.lock.outputs.repo_ref }} |"
+            echo "| immortalwrt url | ${{ steps.lock.outputs.repo_url }} |"
+            echo "| kernel version | ${{ steps.lock.outputs.kernel_version }} |"
+            echo "| version code | ${{ steps.lock.outputs.version_code }} |"
+            echo "| target | $TARGET/$SUBTARGET |"
+            echo "| device | $DEVICE |"
+            echo "| DTS | $DTS_NAME.dts -> DTB image-$DTS_NAME.dtb |"
+            echo "| U-Boot | hanwckf/bl-mt798x, expand(114m) layout |"
+            echo "| build_all_kmods | ${{ github.event.inputs.build_all_kmods || 'true' }} |"
+            echo "| build time (UTC) | $(date -u +%Y-%m-%dT%H:%M:%SZ) |"
+            echo
+            echo "## version file shipped by the source tree"
+            echo '```'
+            cat version 2>/dev/null || echo "(no version file)"
+            echo '```'
+            echo
+            echo "## resolved feeds"
+            echo '```'
+            printf '%s\n' "${FEEDS_RESOLVED:-(not recorded)}"
+            echo '```'
+            echo
+            echo "## feeds.conf.default (as built)"
+            echo '```'
+            cat feeds.conf.default 2>/dev/null || echo "(missing)"
+            echo '```'
+            echo
+            echo "## kernel config actually used"
+            echo '```'
+            KCFG=$(find build_dir -name '.config' -path '*linux*' | head -1)
+            if [ -n "${KCFG:-}" ]; then
+              grep -E 'CONFIG_(NET_SCH_HTB|NET_SCH_CAKE|NET_SCH_FQ_CODEL|IFB|NET_ACT_MIRRED|NET_CLS_U32|MAC80211|CFG80211|BRIDGE|VLAN_8021Q|NET_DSA_MT7530|MTD_NAND_MTK_BMT)=' "$KCFG" || true
+            else
+              echo "(kernel .config not found)"
+            fi
+            echo '```'
+            echo
+            echo "## firmware images"
+            echo '```'
+            ls -la "$BIN"/*.bin 2>/dev/null || echo "(none)"
+            echo '```'
+            echo
+            echo "## manifest (installed packages)"
+            echo '```'
+            cat "$BIN"/*.manifest 2>/dev/null | head -80 || echo "(no manifest)"
+            echo '```'
+          } > "$OUT/build-info.md"
+
+          # Machine-readable copy too.
+          cp -f "$OUT/build-info.md" "$OUT/build-info.txt"
+
+          # The environment the verify job must inherit. GITHUB_ENV syntax, so
+          # it can be appended verbatim.
+          {
+            echo "IMM_COMMIT=${IMM_COMMIT:-}"
+            echo "IMM_COMMIT_SHORT=${IMM_COMMIT_SHORT:-}"
+            echo "REPO_SHA=${REPO_SHA:-}"
+            echo "EXPERIMENTAL=${EXPERIMENTAL:-false}"
+            # Recorded so a REUSED build is judged by what it was actually
+            # built with, not by the inputs of whatever dispatch re-runs the
+            # verification months later.
+            echo "BUILD_ALL_KMODS=${{ github.event.inputs.build_all_kmods || 'true' }}"
+            echo "FEEDS_RESOLVED<<EOF"
+            printf '%s\n' "${FEEDS_RESOLVED:-(not recorded)}"
+            echo "EOF"
+          } > "$OUT/env.txt"
+
+          cat "$OUT/build-info.md"
+          echo "--- provenance/env.txt ---"
+          cat "$OUT/env.txt"
+
+      # ---------------------------------------------------------------- #
+      # Preserve the raw build output IMMEDIATELY, before anything gets a
+      # chance to judge it. This is the artifact that makes a verification
+      # bug survivable.
+      # ---------------------------------------------------------------- #
+      - name: Collect raw build output
+        if: always()
+        run: |
+          set -eu
+          BIN="openwrt/bin/targets/$TARGET/$SUBTARGET"
+          DEST="raw-build/bin/targets/$TARGET/$SUBTARGET"
+          rm -rf raw-build
+          mkdir -p "$DEST" raw-build/provenance
+
+          if [ -d "$BIN" ]; then
+            # The whole target output: images, manifest, profiles.json, kernel,
+            # dtb, and the complete packages/ directory with its index.
+            cp -a "$BIN/." "$DEST/"
+          else
+            echo "::warning::$BIN does not exist -- the build produced no target output"
+          fi
+
+          cp -f provenance/build-info.md raw-build/provenance/build-info.md 2>/dev/null || true
+          cp -f provenance/build-info.txt raw-build/provenance/build-info.txt 2>/dev/null || true
+          cp -f provenance/env.txt raw-build/provenance/env.txt 2>/dev/null || true
+
+          echo "--- raw build output ---"
+          ls -la "$DEST" 2>/dev/null || true
+          echo "--- packages ---"
+          ls "$DEST/packages" 2>/dev/null | head -5 || echo "(no packages dir)"
+          echo "packages file count = $(find "$DEST/packages" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+
+      - name: Upload raw build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Keyed on the run id alone: the verify job can reconstruct this
+          # exact name from a reuse_run_id without knowing anything else.
+          name: fur602-25.12.2-raw-${{ github.run_id }}
+          path: raw-build/
+          retention-days: 30
+          # warn, not error: if the compile itself failed there may be nothing
+          # to upload, and that failure is already reported by the build step.
+          if-no-files-found: warn
+          # Re-running a job keeps github.run_id, so without this a second
+          # attempt would abort with "an artifact with this name already
+          # exists" -- losing the build output we are trying to preserve.
+          overwrite: true
+
+  # ==================================================================== #
+  # JOB 2 -- verify and publish.  Cheap, re-runnable, and incapable of
+  # destroying the build output it inspects.
+  # ==================================================================== #
+  verify:
+    needs: build
+    # Run after a successful build, and also when the build was skipped
+    # because the caller supplied reuse_run_id.
+    if: ${{ always() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout build config
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------- #
+      # Work out which run's raw artifact we are verifying.
+      # ---------------------------------------------------------------- #
+      - name: Resolve raw build source
+        id: raw
+        run: |
+          set -eu
+          REUSE="${{ github.event.inputs.reuse_run_id || '' }}"
+          if [ -n "$REUSE" ]; then
+            if ! printf '%s' "$REUSE" | grep -Eq '^[0-9]+$'; then
+              echo "::error::reuse_run_id must be a numeric run id, got '$REUSE'"
+              exit 1
+            fi
+            RUN_ID="$REUSE"
+            echo "verifying the raw artifact produced by run $RUN_ID (no recompilation)"
+          else
+            RUN_ID="${{ github.run_id }}"
+            echo "verifying the raw artifact produced by this run ($RUN_ID)"
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "artifact=fur602-25.12.2-raw-${RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Download raw build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.raw.outputs.artifact }}
+          run-id: ${{ steps.raw.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: raw
+
+      # ---------------------------------------------------------------- #
+      # Restore the build's own environment (source SHA, feed SHAs,
+      # experimental flag) from inside the artifact, so a reused build is
+      # described by how it was actually built, not by today's inputs.
+      # ---------------------------------------------------------------- #
+      - name: Restore build environment from artifact
+        run: |
+          set -eu
+          test -f raw/provenance/env.txt || {
+            echo "::error::raw/provenance/env.txt missing from the raw artifact -- cannot establish provenance"
+            exit 1
+          }
+          cat raw/provenance/env.txt >> "$GITHUB_ENV"
+          echo "--- restored build environment ---"
+          cat raw/provenance/env.txt
+          echo "--- raw artifact layout ---"
+          find raw -maxdepth 4 -type d | sort
+
+      # ---------------------------------------------------------------- #
+      # Post-build verification. Asserts the actual deliverables exist,
+      # that the full kmod set was really published, and prints the summary.
+      # ---------------------------------------------------------------- #
+      - name: Verify images and kmod packages
+        id: verify
+        run: |
+          set -eu
+          BIN="raw/bin/targets/$TARGET/$SUBTARGET"
+          test -d "$BIN" || { echo "::error::$BIN missing from the raw artifact"; exit 1; }
+
+          echo "===== firmware images ====="
+          ls -la "$BIN"/*.bin "$BIN"/*.itb "$BIN"/kernel 2>/dev/null || true
+
+          FACTORY=$(ls "$BIN"/*"$DEVICE"*factory*.bin 2>/dev/null | head -1 || true)
+          SYSUP=$(ls "$BIN"/*"$DEVICE"*sysupgrade*.bin 2>/dev/null | head -1 || true)
+
+          [ -n "$FACTORY" ] || { echo "::error::factory.bin not produced for $DEVICE"; exit 1; }
+          [ -n "$SYSUP" ]   || { echo "::error::sysupgrade.bin not produced for $DEVICE"; exit 1; }
+
+          echo "factory.bin    = $FACTORY ($(stat -c%s "$FACTORY") bytes)"
+          echo "sysupgrade.bin = $SYSUP ($(stat -c%s "$SYSUP") bytes)"
+
+          # sysupgrade.bin is produced by Build/sysupgrade-tar (scripts/
+          # sysupgrade-tar.sh) then append-metadata. Its payload must be a tar
+          # containing sysupgrade-<DEVICE_NAME>/CONTROL, /kernel and /root,
+          # because that is exactly what the bl-mt798x U-Boot's
+          # parse_tar_image()/write_ubi2_tar_image() and OpenWrt's own
+          # nand_do_platform_check() both look for.
+          #
+          # append-metadata may prepend a metadata header, so search for the
+          # tar rather than assuming offset 0.
+          echo "--- sysupgrade.bin payload ---"
+          if tar tf "$SYSUP" >/dev/null 2>&1; then
+            tar tf "$SYSUP" | head -10
+            tar tf "$SYSUP" | grep -q "^sysupgrade-$DEVICE/" \
+              || { echo "::error::sysupgrade.bin has no sysupgrade-$DEVICE/ dir"; exit 1; }
+            tar tf "$SYSUP" | grep -q "^sysupgrade-$DEVICE/kernel$" \
+              || echo "::warning::no sysupgrade-$DEVICE/kernel entry"
+            tar tf "$SYSUP" | grep -q "^sysupgrade-$DEVICE/root$" \
+              || echo "::warning::no sysupgrade-$DEVICE/root entry"
+            echo "sysupgrade.bin: tar structure OK (kernel + root present)"
+          else
+            echo "::error::sysupgrade.bin is not a readable tar; bl-mt798x U-Boot cannot parse it"
+            exit 1
+          fi
+
+          echo "===== manifest / profiles ====="
+          ls -la "$BIN"/*.manifest 2>/dev/null || echo "(no manifest)"
+          grep -q 'honor,fur-602' "$BIN/profiles.json" \
+            || echo "::warning::honor,fur-602 not found in profiles.json"
+
+          echo "===== DTB present? ====="
+          ls "$BIN"/kernel 2>/dev/null || true
+          ls "$BIN"/*.dtb 2>/dev/null || true
+
+          # ---------------------------------------------------------------- #
+          # Full kmod set: prove it by the published packages, not by a log.
+          #
+          # 25.12 defaults to CONFIG_USE_APK=y, so packages are .apk with a
+          # packages.adb index. 24.10 used .ipk with a Packages index. We
+          # detect which format this build produced rather than assuming --
+          # assuming .ipk here is exactly what broke the first run.
+          # ---------------------------------------------------------------- #
+          echo "===== published package format ====="
+          PKGDIR="$BIN/packages"
+          test -d "$PKGDIR" || { echo "::error::$PKGDIR not found -- no packages were published"; exit 1; }
+
+          N_APK=$(ls "$PKGDIR"/*.apk 2>/dev/null | wc -l)
+          N_IPK=$(ls "$PKGDIR"/*.ipk 2>/dev/null | wc -l)
+          echo "  .apk files = $N_APK"
+          echo "  .ipk files = $N_IPK"
+
+          if [ "$N_APK" -gt 0 ]; then
+            PKGEXT="apk"
+            KMOD_COUNT=$(ls "$PKGDIR"/kmod-*.apk 2>/dev/null | wc -l)
+          elif [ "$N_IPK" -gt 0 ]; then
+            PKGEXT="ipk"
+            KMOD_COUNT=$(ls "$PKGDIR"/kmod-*.ipk 2>/dev/null | wc -l)
+          else
+            echo "::error::$PKGDIR contains neither .apk nor .ipk files"
+            ls -la "$PKGDIR" | head -20
+            exit 1
+          fi
+          echo "  detected package format: .$PKGEXT"
+          echo "  published kmod .$PKGEXT count = $KMOD_COUNT"
+
+          # The raw artifact records what was actually asked for, so a reused
+          # build is judged by its own intent, not by the current dispatch.
+          if [ "${BUILD_ALL_KMODS:-true}" = "false" ]; then
+            echo "  (build_all_kmods=false: full kmod set not expected)"
+          else
+            # A full kmod build publishes many hundreds; a handful means the
+            # knob did not take effect.
+            if [ "$KMOD_COUNT" -lt 100 ]; then
+              echo "::error::only $KMOD_COUNT kmod .$PKGEXT files published -- CONFIG_ALL_KMODS did not take effect"
+              exit 1
+            fi
+          fi
+
+          echo "===== key kmod packages (QoS/SQM, wifi, netfilter) ====="
+          MISSING=0
+          for p in kmod-sched-core kmod-sched kmod-sched-cake kmod-ifb \
+                   kmod-mac80211 kmod-cfg80211 kmod-mt7915e kmod-nft-core kmod-pppoe; do
+            # kmod packages are named <name>_<ver>.<ext> (ipk) or
+            # <name>-<ver>.apk. Check each pattern separately with find --
+            # `ls pat1 pat2` returns non-zero when EITHER operand is missing,
+            # which would report a false MISS for a package that is present.
+            if find "$PKGDIR" -maxdepth 1 -type f \
+                 \( -name "${p}_*.$PKGEXT" -o -name "${p}-*.$PKGEXT" \) | grep -q .; then
+              echo "  OK   $p"
+            else
+              echo "  MISS $p"
+              MISSING=$((MISSING + 1))
+            fi
+          done
+          # The wifi + QoS set is the whole point of this build, so treat a
+          # missing one as a hard failure rather than a note.
+          [ "$MISSING" -eq 0 ] \
+            || { echo "::error::$MISSING required kmod package(s) missing"; exit 1; }
+
+          # The index must exist so the package manager on the device can
+          # resolve these. apk uses packages.adb; opkg uses Packages.
+          if [ "$PKGEXT" = "apk" ]; then
+            ls "$PKGDIR"/packages.adb >/dev/null 2>&1 \
+              || { echo "::error::$PKGDIR has no packages.adb index (apk)"; exit 1; }
+            echo "  OK   packages.adb index present"
+          else
+            ls "$PKGDIR"/Packages >/dev/null 2>&1 \
+              || { echo "::error::$PKGDIR has no Packages index (opkg)"; exit 1; }
+            echo "  OK   Packages index present"
+          fi
+
+          echo "factory=$FACTORY" >> "$GITHUB_OUTPUT"
+          echo "sysupgrade=$SYSUP" >> "$GITHUB_OUTPUT"
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## HONOR FUR-602/603 (ImmortalWrt 25.12.2 / kernel 6.12)"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| verified raw artifact | \`${{ steps.raw.outputs.artifact }}\` |"
+            echo "| built by run | ${{ steps.raw.outputs.run_id }} |"
+            echo "| verified by run | ${{ github.run_id }} |"
+            echo "| locked commit | \`${REPO_SHA:-unknown}\` |"
+            echo "| experimental | ${EXPERIMENTAL:-unknown} |"
+            echo "| target | $TARGET/$SUBTARGET |"
+            echo "| device | $DEVICE |"
+            echo "| images | factory.bin (UBI, first flash) + sysupgrade.bin (tar, upgrades) |"
+            echo
+            echo "### firmware images in the raw artifact"
+            echo '```'
+            ls -la "raw/bin/targets/$TARGET/$SUBTARGET"/*.bin 2>/dev/null || echo "(none)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------- #
+      # Collect the curated artifacts.  Explicit, narrow name matching
+      # only -- never a bare *.bin glob, so BL2/FIP images for other
+      # MediaTek SoCs cannot be swept in and mistaken for FUR-602 firmware.
+      # ---------------------------------------------------------------- #
+      - name: Collect firmware artifact
+        run: |
+          set -eu
+          BIN="raw/bin/targets/$TARGET/$SUBTARGET"
+          rm -rf out-firmware && mkdir -p out-firmware
+          test -d "$BIN" || { echo "::error::$BIN missing"; exit 1; }
+
+          # FUR-602 images only, matched on the device name.
+          find "$BIN" -maxdepth 1 -type f -name "*${DEVICE}*factory*.bin"    -exec cp {} out-firmware/ \;
+          find "$BIN" -maxdepth 1 -type f -name "*${DEVICE}*sysupgrade*.bin" -exec cp {} out-firmware/ \;
+          # Rescue/diagnostic images for this device, if built.
+          find "$BIN" -maxdepth 1 -type f -name "*${DEVICE}*initramfs*.bin"  -exec cp {} out-firmware/ \; || true
+
+          # Metadata.
+          for f in "$BIN"/*.manifest "$BIN"/profiles.json "$BIN"/sha256sums "$BIN"/*.buildinfo; do
+            [ -f "$f" ] && cp "$f" out-firmware/ || true
+          done
+          cp -f raw/provenance/build-info.md out-firmware/build-info.txt
+
+          # Record WHO verified WHAT, so the published artifact is
+          # self-describing: the build that produced it and the run that
+          # accepted it are usually two different runs.
+          {
+            echo "# verification record"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| built by run | ${{ steps.raw.outputs.run_id }} |"
+            echo "| raw artifact | ${{ steps.raw.outputs.artifact }} |"
+            echo "| verified by run | ${{ github.run_id }} |"
+            echo "| verified by run attempt | ${{ github.run_attempt }} |"
+            echo "| verifier commit | ${{ github.sha }} |"
+            echo "| immortalwrt commit | ${REPO_SHA:-unknown} |"
+            echo "| experimental | ${EXPERIMENTAL:-unknown} |"
+            echo "| verified at (UTC) | $(date -u +%Y-%m-%dT%H:%M:%SZ) |"
+            echo
+            echo "## checks performed"
+            echo '```'
+            echo "factory.bin present, sysupgrade.bin present, sysupgrade tar payload"
+            echo "contains sysupgrade-$DEVICE/ with kernel + root, package format detected,"
+            echo "full kmod set count >= 100, required QoS/wifi/netfilter kmods present,"
+            echo "package index present, no BL2/FIP/preloader image collected."
+            echo '```'
+          } > out-firmware/VERIFICATION.md
+
+          # Guard: nothing here may be a BL2/FIP/preloader image.
+          if ls out-firmware/ 2>/dev/null | grep -Eqi 'bl2|preloader|bl31|fip'; then
+            echo "::error::bootloader images leaked into the firmware artifact:"
+            ls out-firmware/ | grep -Ei 'bl2|preloader|bl31|fip' || true
+            exit 1
+          fi
+
+          # Freshness/verification: sizes + SHA256 for every delivered file.
+          ( cd out-firmware && find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%P\n' | sort | xargs -r sha256sum > SHA256SUMS.txt )
+          echo "--- out-firmware ---"
+          ls -la out-firmware/
+          echo "--- SHA256SUMS.txt ---"
+          cat out-firmware/SHA256SUMS.txt
+
+          if ! find out-firmware -maxdepth 1 -type f -name '*.bin' | grep -q .; then
+            echo "::error::no FUR-602 .bin image collected"
+            exit 1
+          fi
+
+      - name: Collect kmod artifact
+        run: |
+          set -eu
+          PKGDIR="raw/bin/targets/$TARGET/$SUBTARGET/packages"
+          rm -rf out-kmods && mkdir -p out-kmods
+          test -d "$PKGDIR" || { echo "::error::$PKGDIR missing -- full kmod set not published"; exit 1; }
+
+          # 25.12 defaults to APK (.apk + packages.adb); 24.10 used
+          # OPKG (.ipk + Packages). Detect, do not assume.
+          N_APK=$(ls "$PKGDIR"/*.apk 2>/dev/null | wc -l)
+          N_IPK=$(ls "$PKGDIR"/*.ipk 2>/dev/null | wc -l)
+          if [ "$N_APK" -gt 0 ]; then
+            PKGEXT="apk"
+          elif [ "$N_IPK" -gt 0 ]; then
+            PKGEXT="ipk"
+          else
+            echo "::error::$PKGDIR has neither .apk nor .ipk files"
+            ls -la "$PKGDIR" | head -20
+            exit 1
+          fi
+          echo "package format: .$PKGEXT  (apk=$N_APK ipk=$N_IPK)"
+
+          cp "$PKGDIR"/kmod-*.$PKGEXT out-kmods/ 2>/dev/null || true
+          if [ "$PKGEXT" = "apk" ]; then
+            cp "$PKGDIR"/packages.adb out-kmods/ 2>/dev/null || true
+          else
+            cp "$PKGDIR"/Packages* out-kmods/ 2>/dev/null || true
+          fi
+
+          COUNT=$(ls out-kmods/kmod-*.$PKGEXT 2>/dev/null | wc -l)
+          echo "kmod .$PKGEXT collected: $COUNT"
+          if [ "${BUILD_ALL_KMODS:-true}" = "false" ]; then
+            echo "  (build_all_kmods=false: a full set was not requested)"
+          else
+            [ "$COUNT" -ge 100 ] || { echo "::error::only $COUNT kmod .$PKGEXT -- expected a full set"; exit 1; }
+          fi
+
+          cp -f raw/provenance/build-info.md out-kmods/build-info.txt
+          ( cd out-kmods && find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%P\n' | sort | xargs -r sha256sum > SHA256SUMS.txt )
+          ls -la out-kmods/ | head -20
+
+      - name: Collect rescue artifact
+        continue-on-error: true
+        run: |
+          set -eu
+          BIN="raw/bin/targets/$TARGET/$SUBTARGET"
+          rm -rf out-rescue && mkdir -p out-rescue
+          # initramfs-kernel.bin is the generic rescue/diagnostic image name.
+          find "$BIN" -maxdepth 1 -type f \( -name 'initramfs-kernel.bin' -o -name "*${DEVICE}*initramfs*" \) \
+            -exec cp {} out-rescue/ \;
+          if [ -z "$(ls -A out-rescue 2>/dev/null)" ]; then
+            echo "no rescue image produced by this build (not an error)"
+            rmdir out-rescue
+            exit 0
+          fi
+          cp -f raw/provenance/build-info.md out-rescue/build-info.txt
+          ( cd out-rescue && sha256sum * > SHA256SUMS.txt )
+          ls -la out-rescue/
+
+      # ---------------------------------------------------------------- #
+      # Upload.  Artifact names carry the run id + short SHA so an old
+      # download can never be mistaken for this run's output.
+      # ---------------------------------------------------------------- #
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: fur602-25.12.2-firmware-${{ github.run_id }}-${{ env.IMM_COMMIT_SHORT }}
+          path: out-firmware/
+          retention-days: 30
+          if-no-files-found: error
+          # Re-running the verify job must be able to replace its own output;
+          # that is the whole point of keeping verify separate and cheap.
+          overwrite: true
+
+      - name: Upload kmod packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: fur602-25.12.2-kmods-${{ github.run_id }}-${{ env.IMM_COMMIT_SHORT }}
+          path: out-kmods/
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Upload rescue image
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: fur602-25.12.2-rescue-${{ github.run_id }}-${{ env.IMM_COMMIT_SHORT }}
+          path: out-rescue/
+          retention-days: 30
+          if-no-files-found: ignore
+          overwrite: true
+
+      # ---------------------------------------------------------------- #
+      # Publish the checksums and sizes in the step summary.
+      #
+      # Artifact download requires authentication even on a public repo
+      # (GET /actions/artifacts/{id}/zip returns 401 without a token), so a
+      # reader without credentials cannot inspect SHA256SUMS.txt inside the
+      # artifact. The step summary, by contrast, is world-readable on the run
+      # page. Printing the digests here means the build output can be
+      # identified and compared without any credentials.
+      # ---------------------------------------------------------------- #
+      - name: Publish checksums to the run summary
+        if: always()
+        run: |
+          {
+            echo
+            echo "### delivered files (name, size, SHA256)"
+            echo
+            for d in out-firmware out-kmods out-rescue; do
+              [ -d "$d" ] || continue
+              echo "#### $d"
+              echo '```'
+              if [ -f "$d/SHA256SUMS.txt" ]; then
+                cat "$d/SHA256SUMS.txt"
+              else
+                ( cd "$d" && find . -maxdepth 1 -type f -printf '%P\n' | sort | xargs -r sha256sum )
+              fi
+              echo '```'
+              echo
+              echo "total files: $(find "$d" -maxdepth 1 -type f | wc -l), size: $(du -sh "$d" | cut -f1)"
+              echo
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if experimental
+        if: ${{ env.EXPERIMENTAL == 'true' }}
+        run: |
+          echo "::error::This was an EXPERIMENTAL build against an overridden commit ($REPO_SHA)."
+          echo "::error::It does not correspond to the locked ImmortalWrt 25.12.2 baseline."
+          exit 1

@@ -1,0 +1,63 @@
+# ============================================================================
+#  HONOR FUR-602/603 -- kernel config fragment for ImmortalWrt 25.12.2
+# ============================================================================
+#  Applied to: target/linux/mediatek/filogic/config-6.12
+#
+#  ---------------------------------------------------------------------------
+#  PART 1 -- WHY THE KERNEL-CONFIG PART IS EMPTY
+#  ---------------------------------------------------------------------------
+#  There are NO active directives in this file. Every line is a comment.
+#
+#  Upstream ImmortalWrt/OpenWrt keeps the following OUT of the target kernel
+#  config on purpose, and ships them as opt-in kmod packages instead:
+#
+#    * tc / qdisc / ifb      (NET_SCH_*, NET_CLS_*, IFB, NET_ACT_MIRRED)
+#    * netfilter             (NF_TABLES, ...)
+#    * mac80211 / mt76       (MAC80211, CFG80211)
+#    * USB                   (USB_XHCI_HCD, ...)
+#
+#  These are exactly the things a QoS/SQM user wants, so the temptation is to
+#  force them to =y. DO NOT DO THAT:
+#
+#    * it bloats the kernel and diverges from upstream, which makes future
+#      rebases harder and increases the chance of a boot failure;
+#    * it is unnecessary -- the same modules are available as kmod packages
+#      built from the identical source tree, so they are ABI-compatible.
+#
+#  The reference port for this board (hanwckf/immortalwrt-mt798x,
+#  target/linux/mediatek/mt7981/config-5.4) takes the same approach.
+#
+#  ---------------------------------------------------------------------------
+#  PART 2 -- WHAT WE ACTUALLY DO INSTEAD
+#  ---------------------------------------------------------------------------
+#  The build is configured with
+#
+#      CONFIG_ALL_KMODS=y
+#
+#  CONFIG_ALL_KMODS is a *tristate* knob: it flips every kmod package from its
+#  default `n` to `m`. `m` means "build this package and publish it as an .ipk
+#  into bin/targets/mediatek/filogic/packages/", NOT "install it into the
+#  image". Only packages forced to `y` (DEFAULT_PACKAGES + our DEVICE_PACKAGES)
+#  end up in the rootfs.
+#
+#  Result: a lean image, plus a complete, ABI-matched kmod set that can be
+#  side-loaded later on the device, e.g.
+#
+#      opkg install kmod-sched-cake kmod-ifb kmod-nft-core
+#
+#  This is deliberately NOT CONFIG_ALL=y, which would additionally pull in every
+#  *application* package and make the image unrecognisable.
+#
+#  The workflow enforces CONFIG_ALL_KMODS=y and verifies the kmod .ipks were
+#  actually produced, so "full kmod build" is proven by artifacts, not by a log
+#  line.
+#
+#  ---------------------------------------------------------------------------
+#  RULES FOR FUTURE EDITS
+#  ---------------------------------------------------------------------------
+#    * Never blanket-enable symbols here.
+#    * Only add a symbol if it is genuinely impossible to express as a kmod, and
+#      document the reason inline with the evidence that forced it.
+#    * Keep this fragment target-scoped: mediatek has no per-target config-6.12,
+#      so filogic/config-6.12 is the highest-priority file kconfig.pl merges for
+#      this target. Putting the fragment anywhere else would silently not apply.
