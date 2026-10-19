@@ -368,44 +368,56 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
-          # Capture output instead of letting `set -e` swallow it: the job log
-          # needs a token to read, but ::error:: annotations are public, so the
-          # real reason must be surfaced that way.
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::release $RELEASE_TAG already exists; refusing to modify an existing archive"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+
+          # Refuse to touch an existing archive.
+          existing=$(curl -sS -o /dev/null -w '%{http_code}' \
+                     -H "Authorization: Bearer ${GH_TOKEN}" \
+                     "${API}/releases/tags/${RELEASE_TAG}" || echo "000")
+          if [ "$existing" = "200" ]; then
+            echo "::error::release ${RELEASE_TAG} already exists; refusing to modify an existing archive"
             exit 1
           fi
 
-          echo "creating release $RELEASE_TAG at $TARGET_COMMIT"
-          if ! out=$(gh release create "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$TARGET_COMMIT" \
-              --title "HONOR FUR-602 — ImmortalWrt 25.12.2" \
-              --notes-file work/release-notes.md \
-              --prerelease \
-              assets/*.zip SHA256SUMS.txt 2>&1); then
-            echo "$out"
-            msg=$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-600)
-            # A 403 here means the token lacked contents:write for THIS run.
-            # The repository policy is verified to be "Read and write", so do
-            # not assert a repository-setting cause without checking it.
-            case "$out" in
-              *"Resource not accessible by integration"*|*"403"*)
-                echo "::error::gh release create failed: $msg"
-                echo "::error::The run token was refused contents:write. The workflow declares it and the repository policy is 'Read and write', so before changing anything check: (1) the run's own permissions as shown on the job summary page, (2) whether this run started before the setting was saved -- re-run it, (3) whether the workflow file on the ref being run actually contains the permissions block."
-                ;;
-              *)
-                echo "::error::gh release create failed: $msg"
-                ;;
-            esac
+          # Build the body with jq so the notes are escaped correctly.
+          jq -n --arg tag "$RELEASE_TAG" \
+                --arg target "$TARGET_COMMIT" \
+                --arg name "HONOR FUR-602 — ImmortalWrt 25.12.2" \
+                --rawfile body work/release-notes.md \
+                '{tag_name:$tag, target_commitish:$target, name:$name,
+                  body:$body, prerelease:true, draft:false}' > work/release.json
+
+          code=$(curl -sS -o work/release-resp.json -w '%{http_code}' -X POST \
+                 -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H "Accept: application/vnd.github+json" \
+                 "${API}/releases" -d @work/release.json || echo "000")
+          echo "POST /releases -> HTTP ${code}"
+          if [ "$code" != "201" ]; then
+            echo "::error::POST /releases failed: HTTP ${code}: $(tr '\n' ' ' < work/release-resp.json | cut -c1-500)"
             exit 1
           fi
-          echo "$out"
-          echo "release created"
 
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --json tagName,url,isPrerelease,assets \
-            | jq -r '"tag: \(.tagName)\nurl: \(.url)\nprerelease: \(.isPrerelease)", (.assets[] | "  \(.name)  \(.size)  \(.digest // "")")'
+          rid=$(jq -r '.id' work/release-resp.json)
+          html=$(jq -r '.html_url' work/release-resp.json)
+          upload=$(jq -r '.upload_url' work/release-resp.json | sed 's/{?name,label}//')
+          echo "release id: ${rid}"
+          echo "release url: ${html}"
+
+          # Upload the three artifacts plus the checksum manifest.
+          for f in assets/*.zip SHA256SUMS.txt; do
+            n=$(basename "$f")
+            acode=$(curl -sS -o work/up.json -w '%{http_code}' -X POST \
+                    -H "Authorization: Bearer ${GH_TOKEN}" \
+                    -H "Content-Type: application/octet-stream" \
+                    "${upload}?name=${n}" --data-binary "@${f}" || echo "000")
+            echo "  upload ${n} -> HTTP ${acode}"
+            if [ "$acode" != "201" ]; then
+              echo "::error::asset upload failed for ${n}: HTTP ${acode}: $(tr '\n' ' ' < work/up.json | cut -c1-400)"
+              exit 1
+            fi
+          done
+
+          echo "release created with all assets"
 
       - name: Confirm the tag points at the device-adapt commit
         if: ${{ env.PUBLISH == 'true' }}
