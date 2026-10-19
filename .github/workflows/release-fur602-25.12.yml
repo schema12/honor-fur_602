@@ -334,9 +334,20 @@ jobs:
               --prerelease \
               assets/*.zip SHA256SUMS.txt 2>&1); then
             echo "$out"
-            # Collapse to one line so the annotation stays readable.
-            msg=$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-800)
-            echo "::error::gh release create failed: $msg"
+            msg=$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-600)
+            # The most common failure is not a bug in this workflow: the
+            # repository's default workflow-token permission is "read", which
+            # silently downgrades `contents: write` and makes the Releases API
+            # answer 403 "Resource not accessible by integration".
+            case "$out" in
+              *"Resource not accessible by integration"*|*"403"*)
+                echo "::error::gh release create failed: $msg"
+                echo "::error::This is a repository setting, not a workflow bug. Fix: Settings -> Actions -> General -> Workflow permissions -> 'Read and write permissions' -> Save, then re-run this job. The workflow already declares contents: write; the repository policy overrides it."
+                ;;
+              *)
+                echo "::error::gh release create failed: $msg"
+                ;;
+            esac
             exit 1
           fi
           echo "$out"
