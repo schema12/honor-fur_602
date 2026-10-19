@@ -336,7 +336,31 @@ jobs:
           echo "token permissions as reported by the API:"
           printf '%s' "$meta" | jq -r '.permissions // empty | to_entries[] | "  \(.key): \(.value)"' 2>/dev/null \
             || echo "  (none reported)"
-          echo "::warning::token probe: GET /releases -> HTTP ${readcode}; repo=$(printf '%s' "$meta" | jq -r '.full_name // "?"' 2>/dev/null || echo '?')"
+
+          # Decisive experiment: does this token have contents:write AT ALL?
+          # Creating a git ref needs exactly the same scope as creating a
+          # release, and it is reversible, so it isolates "token cannot write"
+          # from "releases specifically are blocked".
+          probe_ref="refs/tags/zz-token-probe-${GITHUB_RUN_ID}"
+          refcode=$(curl -sS -o work/ref.json -w '%{http_code}' -X POST \
+                    -H "Authorization: Bearer ${GH_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs" \
+                    -d "{\"ref\":\"${probe_ref}\",\"sha\":\"$(git rev-parse HEAD)\"}" || echo "000")
+          echo "POST /git/refs -> HTTP ${refcode}"
+          if [ "$refcode" = "201" ]; then
+            echo "  token CAN write contents; releases should work too"
+            curl -sS -o /dev/null -X DELETE \
+                 -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H "Accept: application/vnd.github+json" \
+                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/${probe_ref}" || true
+            echo "  probe ref deleted"
+          else
+            echo "  body: $(cat work/ref.json 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+            echo "  token CANNOT write contents at all"
+          fi
+
+          echo "::warning::token probe: GET /releases=${readcode}; POST /git/refs=${refcode}; repo=$(printf '%s' "$meta" | jq -r '.full_name // "?"' 2>/dev/null || echo '?')"
 
       - name: Create the Release
         if: ${{ env.PUBLISH == 'true' }}
