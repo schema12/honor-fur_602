@@ -312,9 +312,14 @@ jobs:
           echo "notes written: $(wc -l < work/release-notes.md) lines"
 
       # ---------------------------------------------------------------- #
-      # Report what the run's own token can actually do, before relying on
-      # it. The job log needs a token to read, but ::error::/::warning::
-      # annotations are public, so the findings go there too.
+      # Report what the run's own token can do, before relying on it. The job
+      # log needs a token to read, but ::warning:: annotations are public, so
+      # the findings go there too.
+      #
+      # Note: GET /actions/permissions/workflow is deliberately NOT probed.
+      # It requires repository admin, so a 403 there says nothing about the
+      # token's contents:write capability and previously caused a wrong
+      # diagnosis.
       # ---------------------------------------------------------------- #
       - name: Probe token permissions
         if: ${{ env.PUBLISH == 'true' }}
@@ -322,47 +327,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
-          echo "== scopes reported by the API for this token =="
-          headers=$(curl -sS -D - -o /dev/null -H "Authorization: Bearer ${GH_TOKEN}" \
-                    https://api.github.com/rate_limit 2>&1 || true)
-          printf '%s\n' "$headers" | grep -i '^x-oauth-scopes:' || echo "  (no x-oauth-scopes header; GitHub App tokens report none)"
-          printf '%s\n' "$headers" | grep -i '^x-accepted-oauth-scopes:' || true
-
-          echo
-          echo "== can this token read the repo metadata? =="
           meta=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
                  "https://api.github.com/repos/${GITHUB_REPOSITORY}" || true)
-          printf '%s' "$meta" | jq -r '"  default_branch: \(.default_branch)  private: \(.private)"' 2>/dev/null \
-            || echo "  could not parse repo metadata"
-
-          echo
-          echo "== can this token see existing releases (read path)? =="
           readcode=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${GH_TOKEN}" \
                      "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=1" || echo "000")
-          echo "  GET /releases -> HTTP ${readcode}"
-
-          echo
-          echo "== what does the token itself claim about its permissions? =="
+          echo "GET /releases -> HTTP ${readcode}"
+          echo "repo: $(printf '%s' "$meta" | jq -r '.full_name // "?"' 2>/dev/null || echo '?')"
+          echo "token permissions as reported by the API:"
           printf '%s' "$meta" | jq -r '.permissions // empty | to_entries[] | "  \(.key): \(.value)"' 2>/dev/null \
-            || echo "  (repo payload carried no permissions block)"
-          echo "  repo payload keys: $(printf '%s' "$meta" | jq -r 'keys | join(",")' 2>/dev/null || echo '?')"
-
-          echo
-          echo "== repository workflow-permission policy (the decisive check) =="
-          # If this policy is "read", it caps the token no matter what the
-          # workflow declares, and every write returns 403.
-          pol=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer ${GH_TOKEN}" \
-                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/permissions/workflow" 2>&1 || true)
-          polbody=$(printf '%s' "$pol" | sed '$d')
-          polcode=$(printf '%s' "$pol" | tail -n1)
-          echo "  GET /actions/permissions/workflow -> HTTP ${polcode}"
-          echo "  body: ${polbody}"
-          pol_default=$(printf '%s' "$polbody" | jq -r '.default_workflow_permissions // "?"' 2>/dev/null || echo '?')
-          echo "  default_workflow_permissions = ${pol_default}"
-
-          # Surface the decisive facts publicly, so a failure is diagnosable
-          # without any credential.
-          echo "::warning::token probe: GET /releases -> HTTP ${readcode}; GET /actions/permissions/workflow -> HTTP ${polcode}; default_workflow_permissions=${pol_default}; repo default_branch=$(printf '%s' "$meta" | jq -r '.default_branch // "?"' 2>/dev/null || echo '?')"
+            || echo "  (none reported)"
+          echo "::warning::token probe: GET /releases -> HTTP ${readcode}; repo=$(printf '%s' "$meta" | jq -r '.full_name // "?"' 2>/dev/null || echo '?')"
 
       - name: Create the Release
         if: ${{ env.PUBLISH == 'true' }}
@@ -388,14 +362,13 @@ jobs:
               assets/*.zip SHA256SUMS.txt 2>&1); then
             echo "$out"
             msg=$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-600)
-            # A 403 "Resource not accessible by integration" here is almost
-            # never a bug in this workflow: it means the repository's default
-            # workflow-token permission is "read", which silently overrides the
-            # `contents: write` declared above. That is a repository setting.
+            # A 403 here means the token lacked contents:write for THIS run.
+            # The repository policy is verified to be "Read and write", so do
+            # not assert a repository-setting cause without checking it.
             case "$out" in
               *"Resource not accessible by integration"*|*"403"*)
                 echo "::error::gh release create failed: $msg"
-                echo "::error::This is a repository setting, not a workflow bug. It needs Settings -> Actions -> General -> Workflow permissions -> 'Read and write permissions' -> Save. The workflow already declares contents: write; the repository policy overrides it. (This repository has been set to read/write, so seeing this here again means the setting was reverted, or this is a fork.)"
+                echo "::error::The run token was refused contents:write. The workflow declares it and the repository policy is 'Read and write', so before changing anything check: (1) the run's own permissions as shown on the job summary page, (2) whether this run started before the setting was saved -- re-run it, (3) whether the workflow file on the ref being run actually contains the permissions block."
                 ;;
               *)
                 echo "::error::gh release create failed: $msg"
